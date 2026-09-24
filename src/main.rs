@@ -91,6 +91,10 @@ fn main() {
 
     let configuration = config::Config::load();
 
+    // Keep the login entry pointing at wherever this copy actually lives; an
+    // update or reinstall moves the executable.
+    win::autostart::sync(configuration.autostart);
+
     let (commands, receiver) = async_channel::unbounded::<win::tray::Command>();
     let capture_hotkey = win::hotkey::parse(&configuration.hotkey_capture);
     let restore_hotkey = win::hotkey::parse(&configuration.hotkey_restore_pin);
@@ -112,9 +116,14 @@ fn main() {
         .with_quit_mode(gpui_kit::QuitMode::Explicit)
         .run(move |cx| {
             gpui_kit::init(cx);
+            let silent = configuration.silent_start;
             cx.set_global(app::AppState::new(configuration));
 
-            app::open_settings(cx);
+            // The tray icon is the app. Unless the user asked for the window,
+            // starting up means starting quietly.
+            if !silent {
+                app::open_settings(cx);
+            }
 
             // The tray thread never touches the UI directly; it posts commands
             // here and this task wakes the moment one arrives.

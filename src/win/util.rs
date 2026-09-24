@@ -122,6 +122,41 @@ pub fn show_move_cursor() {
     }
 }
 
+/// Asks the user for a folder, starting at `start`.
+///
+/// `SHBrowseForFolder` is the old shell picker, but it is one call plus one path
+/// lookup, it needs no COM apartment setup, and it is still the dialog Windows
+/// itself shows for "choose a folder" in plenty of places.
+pub fn pick_folder(start: &std::path::Path) -> Option<std::path::PathBuf> {
+    use windows::Win32::UI::Shell::{
+        BIF_NEWDIALOGSTYLE, BIF_RETURNONLYFSDIRS, BROWSEINFOW, SHBrowseForFolderW,
+        SHGetPathFromIDListW,
+    };
+    use windows::core::{PCWSTR, PWSTR};
+
+    let title = wide("选择保存位置");
+    let mut initial = wide(&start.display().to_string());
+    let mut info = BROWSEINFOW {
+        hwndOwner: unsafe { GetForegroundWindow() },
+        pszDisplayName: PWSTR(initial.as_mut_ptr()),
+        lpszTitle: PCWSTR(title.as_ptr()),
+        ulFlags: BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE,
+        ..Default::default()
+    };
+    unsafe {
+        let id_list = SHBrowseForFolderW(&mut info);
+        if id_list.is_null() {
+            return None; // cancelled
+        }
+        let mut buffer = [0u16; 260];
+        if !SHGetPathFromIDListW(id_list, &mut buffer).as_bool() {
+            return None;
+        }
+        let length = buffer.iter().position(|unit| *unit == 0).unwrap_or(buffer.len());
+        Some(std::path::PathBuf::from(String::from_utf16_lossy(&buffer[..length])))
+    }
+}
+
 /// Whether a virtual key is physically held down right now.
 ///
 /// GPUI reports nothing at all for a bare modifier press — a lone Shift simply

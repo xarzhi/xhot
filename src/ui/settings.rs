@@ -478,6 +478,75 @@ fn general_page(config: &crate::config::Config, theme: Theme, cx: &mut Context<S
                     config.copy_on_finish = !config.copy_on_finish;
                 })),
         )
+        .child(
+            card(theme)
+                .child(div().child("启动"))
+                .child(setting_row(
+                    "开机启动",
+                    "登录 Windows 后自动运行 xshot",
+                    config.autostart,
+                    "autostart-toggle",
+                    theme,
+                    cx,
+                    |config| {
+                        config.autostart = !config.autostart;
+                        // The registry is the real state, so write it as soon as
+                        // the switch moves rather than at some later exit.
+                        if let Err(error) = crate::win::autostart::set_enabled(config.autostart) {
+                            eprintln!("xshot: could not update startup: {error:#}");
+                        }
+                    },
+                ))
+                .child(setting_row(
+                    "静默启动",
+                    "启动时不打开这个窗口，只驻留托盘图标",
+                    config.silent_start,
+                    "silent-toggle",
+                    theme,
+                    cx,
+                    |config| config.silent_start = !config.silent_start,
+                )),
+        )
+        .child(
+            card(theme)
+                .child(div().child("完成后同时复制到剪贴板"))
+                .child(caption(
+                    "关闭后，保存或钉图不会顺带写入剪贴板".into(),
+                    theme,
+                ))
+                .child(toggle(config.copy_on_finish, "copy-toggle", theme, cx, |config| {
+                    config.copy_on_finish = !config.copy_on_finish;
+                })),
+        )
+        .into_any_element()
+}
+
+/// One "label + hint on the left, switch on the right" settings row.
+fn setting_row(
+    title: &'static str,
+    hint: &'static str,
+    value: bool,
+    id: &'static str,
+    theme: Theme,
+    cx: &mut Context<Settings>,
+    mutate: fn(&mut crate::config::Config),
+) -> AnyElement {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .gap(px(12.0))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .flex_1()
+                .child(div().text_size(px(TEXT_BODY)).text_color(theme.text).child(title))
+                .child(caption(hint.into(), theme)),
+        )
+        .child(toggle(value, id, theme, cx, mutate))
         .into_any_element()
 }
 

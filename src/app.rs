@@ -18,6 +18,7 @@ use crate::win::{tray, util as win_util};
 /// to recover the HWND of a window GPUI created for us.
 pub const SETTINGS_TITLE: &str = "xshot 设置";
 pub const OVERLAY_TITLE: &str = "xshot-overlay";
+pub const SAVE_TITLE: &str = "xshot 保存";
 pub const PIN_TITLE_PREFIX: &str = "xshot-pin-";
 
 /// Everything needed to put a pinned shot back on screen later.
@@ -38,6 +39,8 @@ pub struct AppState {
     pub config: Config,
     pub settings: Option<AnyWindowHandle>,
     pub overlay: Option<WindowHandle<Overlay>>,
+    /// The "where should this go?" window, while one is open.
+    pub save_dialog: Option<AnyWindowHandle>,
     pub pins: Vec<AnyWindowHandle>,
     pub next_pin_id: u32,
     /// The most recent pin, for the restore hotkey.
@@ -55,6 +58,7 @@ impl AppState {
             config,
             settings: None,
             overlay: None,
+            save_dialog: None,
             pins: Vec::new(),
             next_pin_id: 1,
             last_pin: None,
@@ -67,8 +71,7 @@ pub fn state(cx: &App) -> &AppState {
     cx.global::<AppState>()
 }
 
-pub fn state_mut(cx: &mut App) -> &mut AppState {
-    cx.global_mut::<AppState>()
+pub fn state_mut(cx: &mut App) -> &mut AppState {    cx.global_mut::<AppState>()
 }
 
 /// Records a configuration change and writes it straight to disk, so the
@@ -97,7 +100,8 @@ pub fn open_settings(cx: &mut App) {
         state_mut(cx).settings = None;
     }
 
-    let bounds = Bounds::centered(None, size(px(860.0), px(560.0)), cx);
+    // Tall enough for the general page's four cards without scrolling.
+    let bounds = Bounds::centered(None, size(px(860.0), px(680.0)), cx);
     let theme = state(cx).config.resolved_theme();
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -108,7 +112,7 @@ pub fn open_settings(cx: &mut App) {
         }),
         is_resizable: false,
         is_minimizable: true,
-        window_min_size: Some(size(px(860.0), px(560.0))),
+        window_min_size: Some(size(px(860.0), px(680.0))),
         // The Mica material is the Fluent window backdrop on Windows 11.
         window_background: theme.backdrop(),
         ..Default::default()
@@ -122,6 +126,21 @@ pub fn open_settings(cx: &mut App) {
         Ok(handle) => state_mut(cx).settings = Some(handle.into()),
         Err(error) => eprintln!("xshot: could not open settings: {error:#}"),
     }
+}
+
+/// Closes the capture session: the save window (if any) and the overlay.
+///
+/// A save finishes the session, so both windows go together.
+pub fn close_capture(cx: &mut App) {
+    crate::ui::save_dialog::close(cx);
+    if let Some(handle) = state_mut(cx).overlay.take() {
+        let _ = handle.update(cx, |_, window, _| window.remove_window());
+    }
+}
+
+/// Closes just the save window, leaving the capture open to keep editing.
+pub fn close_save_dialog(cx: &mut App) {
+    crate::ui::save_dialog::close(cx);
 }
 
 /// Handles the settings window's close button according to the configured

@@ -456,11 +456,10 @@ impl Overlay {
                 }
             }
             Finish::Save => {
-                let directory = app::state(cx).config.save_dir.clone();
-                let name = format!("xshot_{}.png", chrono::Local::now().format("%Y%m%d_%H%M%S"));
-                if let Err(error) = output.save_png(&directory.join(name)) {
-                    eprintln!("xshot: save failed: {error:#}");
-                }
+                // Ask where it goes. The overlay stays open behind the dialog so
+                // that cancelling puts the user back where they were.
+                crate::ui::save_dialog::open(cx, output);
+                return;
             }
             Finish::Pin => {
                 // The pin should land exactly where the selection sat on screen.
@@ -1802,6 +1801,12 @@ impl Overlay {
 
     fn toolbar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let selection = self.selection?;
+        // Held back until the region is settled. During the initial drag the
+        // toolbar would be chasing the pointer and sitting on top of exactly the
+        // part of the screen the user is still framing.
+        if matches!(self.drag, Some(Drag::Creating { .. })) {
+            return None;
+        }
         let (view_w, view_h) = self.view_size();
 
         // Sit under the selection's bottom-right corner, flipping above it when

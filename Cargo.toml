@@ -74,3 +74,18 @@ outDir = "dist"
 
 [package.metadata.packager.nsis]
 installerIcon = "assets/icon.ico"
+# The installer speaks Chinese. NSIS ships a Simplified Chinese language file, so
+# this only has to name it.
+languages = ["SimpChinese"]
+# Whatever folder the user picks, the app goes into its own subfolder: an
+# installer that scatters xshot.exe and uninstall.exe straight into `D:\Downloads`
+# is a mess to undo. The default folder already ends in `xshot`, and the check
+# keeps that from turning into `...\xshot\xshot`.
+preinstallSection = '''
+Section DirSuffix
+  StrCpy $R9 $INSTDIR "" -6
+  StrCmp $R9 "\xshot" done
+  StrCpy $INSTDIR "$INSTDIR\xshot"
+  done:
+SectionEnd
+'''

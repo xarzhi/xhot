@@ -106,6 +106,10 @@ pub struct Config {
     /// Copy the finished shot to the clipboard as well as doing whatever the
     /// finish action is.
     pub copy_on_finish: bool,
+    /// Register the app to start with Windows.
+    pub autostart: bool,
+    /// Start without opening the settings window — just the tray icon.
+    pub silent_start: bool,
 
     // -- 外观 ---------------------------------------------------------------
     pub theme: ThemeChoice,
@@ -136,6 +140,10 @@ impl Default for Config {
             close_behavior: CloseBehavior::default(),
             save_dir: default_save_dir(),
             copy_on_finish: true,
+            autostart: false,
+            // A screenshot tool lives in the tray; showing the settings window
+            // on every login would be noise.
+            silent_start: true,
             theme: ThemeChoice::default(),
             pin_shadow: true,
             finish_action: FinishAction::default(),
@@ -151,12 +159,20 @@ impl Default for Config {
     }
 }
 
-/// `%USERPROFILE%\Pictures\xshot`, falling back to the temp directory.
+/// The desktop, where a screenshot is easiest to find again.
 pub fn default_save_dir() -> PathBuf {
-    match std::env::var_os("USERPROFILE") {
-        Some(home) => PathBuf::from(home).join("Pictures").join("xshot"),
-        None => std::env::temp_dir().join("xshot"),
-    }
+    desktop_dir().unwrap_or_else(std::env::temp_dir)
+}
+
+/// `%USERPROFILE%\Desktop`.
+pub fn desktop_dir() -> Option<PathBuf> {
+    std::env::var_os("USERPROFILE").map(|home| PathBuf::from(home).join("Desktop"))
+}
+
+/// Where `保存` used to write before the save dialog existed.
+fn legacy_save_dir() -> Option<PathBuf> {
+    std::env::var_os("USERPROFILE")
+        .map(|home| PathBuf::from(home).join("Pictures").join("xshot"))
 }
 
 pub fn config_path() -> PathBuf {
@@ -187,6 +203,14 @@ impl Config {
         }
         if self.hotkey_restore_pin == "Ctrl+Alt+P" {
             self.hotkey_restore_pin = "F2".into();
+        }
+        // Saving now goes through a dialog that defaults to the desktop, so a
+        // config still pointing at the old built-in folder is carrying a value
+        // nobody chose.
+        if let Some(legacy) = legacy_save_dir() {
+            if self.save_dir == legacy {
+                self.save_dir = default_save_dir();
+            }
         }
     }
 
