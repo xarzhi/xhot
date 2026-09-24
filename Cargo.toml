@@ -58,3 +58,19 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# Installer packaging. `cargo packager --release` produces a per-user NSIS
+# installer in `dist/`; the icon is not a checked-in drawing but the output of
+# `xshot --export-icon assets/icon.ico`, so the tray icon and the installer icon
+# can never drift apart.
+[package.metadata.packager]
+productName = "xshot"
+identifier = "com.xarzhi.xshot"
+description = "A lean, fast Windows screenshot tool: region capture, annotations, pinning and colour picking."
+authors = ["夏至"]
+icons = ["assets/icon.ico"]
+formats = ["nsis"]
+outDir = "dist"
+
+[package.metadata.packager.nsis]
+installerIcon = "assets/icon.ico"

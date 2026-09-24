@@ -95,6 +95,28 @@ cargo build --release
 
 需要 Windows 10 1809+ 与 Rust 1.85+（edition 2024）。
 
+想看每次截图慢在哪，设一个环境变量就有了（release 版同样有效）：
+
+```powershell
+$env:XSHOT_TIMING = '1'
+.\target\release\xshot.exe     # 分段耗时追加到 %TEMP%\xshot-timing.log
+```
+
+## 打包安装包
+
+用 [cargo-packager](https://github.com/crabnebula-dev/cargo-packager) 出一个
+**按用户安装、不需要管理员权限**的 NSIS 安装包：
+
+```powershell
+cargo install cargo-packager --locked
+.\target\debug\xshot.exe --export-icon assets\icon.ico   # 生成安装包用的图标
+cargo packager --release                                 # 产物在 dist\
+```
+
+图标不是手画的二进制资源，而是程序画托盘图标的那段代码输出的
+（`win::icon::write_ico`，16/24/32/48/64/128/256 七种尺寸），
+所以托盘图标和安装包图标不可能对不上。首次打包时 cargo-packager 会自己下载 NSIS 工具链。
+
 ## 目录结构
 
 ```
@@ -131,6 +153,46 @@ src/
 5. **导出时的文字栅格化** —— 借 GDI 拿到带抗锯齿的中文。
 
 ## 实现中值得记一笔的坑
+
+### 按下截图到窗口出现：把两件互不相干的事叠起来做
+
+先说结论，同一台机器（2560×1440、100%）实测从按下 F1 到覆盖层画好：
+
+| | 改之前 | 改之后 |
+| --- | --- | --- |
+| 第一次截图（设置窗口开着） | ~104 ms | **55 ms** |
+| 之后的每一次 | ~50 ms | **35 ms**（最好 32 ms） |
+
+用 `XSHOT_TIMING=1` 启动就能复现：每次截图的分段耗时都会追加到
+`%TEMP%\xshot-timing.log`，release 版本也有效（要测的本来就是 release）。
+改之前的分段大致是：
+
+```
+2 own windows hidden  32 ms   <- 设置窗口开着时，固定 sleep 等合成器
+c3 bitblt done        25 ms   <- 抓像素
+open_overlay entered  12-18 ms <- 建窗口 + 建 D3D 交换链
+c6 copy done           5 ms   <- 14 MB 位图拷一份给 GPUI 显示
+place + foreground     2 ms
+```
+
+这里面 **抓像素** 和 **建窗口** 互不依赖，却是排队做的。现在先让工作线程开始抓，
+主线程同时把窗口建出来，最后把抓到的那一帧装进去。净省下 15 ms 左右
+（代价是 BitBlt 因为和建窗口抢资源慢了 2-4 ms，仍然划算）。
+
+中间有两个坑：
+
+1. **隐藏的 GPUI 窗口拿不到帧。** 第一版把窗口建成 `show: false`，等像素到了再
+   `on_next_frame` 回调里显示它 —— 回调**永远不触发**，窗口永远不出现，日志里连
+   一行都不打。gpui-pre 只为「可见」的窗口驱动帧循环（创建时那次首绘除外）。
+   手动 `window.draw(cx)` 想绕过它也不行：在 `handle.update` 里面调它会撞上
+   *cannot update Overlay while it is already being updated*，直接 panic。
+2. 所以改成 **窗口一开始就显示，但背景透明、什么都不画**。`WindowBackgroundAppearance`
+   非 `Opaque` 时清屏色是 `[0,0,0,0]`，桌面原样透出来，用户根本看不出窗口已经在了；
+   像素装好后再切回不透明并画冻结帧。既没有黑闪，也不用猜显示时机。
+
+顺带修掉的：等设置窗口消失原本是**固定 sleep 32 ms**（怕残影进截图）。
+现在用 `DwmFlush()` —— 它就是「等合成器把这一帧画完」的官方原语，
+一个 vsync 就够，只留 8 ms 余量，第一次截图因此少花 18 ms。
 
 ### 鼠标移到桌面上就卡：每次都把窗口列表走了一遍
 

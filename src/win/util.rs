@@ -474,9 +474,25 @@ pub fn hide_window_and_wait(title: &str, timeout: std::time::Duration) -> bool {
     }
 
     // `ShowWindow` is synchronous on the window's own thread, but the desktop
-    // compositor still holds the previous frame for a moment; give it one.
-    std::thread::sleep(std::time::Duration::from_millis(32));
+    // compositor still holds the previous frame for a moment. `DwmFlush` is the
+    // documented way to wait for exactly that — it returns once the compositor
+    // has finished the frame that drops our window — and it costs one vsync
+    // instead of the flat 32 ms this used to sleep. That sleep was the whole
+    // cost of the first capture after the settings window had been open.
+    flush_composition();
+
+    // A short margin on top: `DwmFlush` can return just before the frame is on
+    // screen if the queue was already empty.
+    std::thread::sleep(std::time::Duration::from_millis(8));
     true
+}
+
+/// Blocks until the desktop compositor has finished its next frame.
+fn flush_composition() {
+    use windows::Win32::Graphics::Dwm::DwmFlush;
+    unsafe {
+        let _ = DwmFlush();
+    }
 }
 
 #[cfg(test)]

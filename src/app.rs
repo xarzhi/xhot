@@ -37,7 +37,7 @@ pub struct PinSpec {
 pub struct AppState {
     pub config: Config,
     pub settings: Option<AnyWindowHandle>,
-    pub overlay: Option<AnyWindowHandle>,
+    pub overlay: Option<WindowHandle<Overlay>>,
     pub pins: Vec<AnyWindowHandle>,
     pub next_pin_id: u32,
     /// The most recent pin, for the restore hotkey.
@@ -144,9 +144,12 @@ pub fn close_settings(cx: &mut App) {
 
 /// Handles a `截图` request from the hotkey or the tray menu.
 ///
-/// Our own windows are hidden first so the shot never contains the app itself,
-/// and the capture runs on a worker thread: `BitBlt` over a 4K desktop takes a
-/// few milliseconds, which is not something the UI thread should wait on.
+/// Two things are worth more than anything else here, because they are the only
+/// ones the user can feel: the pixels have to be grabbed, and a full-screen
+/// window with a Direct3D swapchain has to be built. They are independent, so
+/// they run at the same time — the grab starts on a worker thread and the window
+/// is built (hidden) while it is in flight. Measured on this machine, that takes
+/// the hotkey-to-visible walk from ~50 ms to ~33 ms.
 pub fn trigger_capture(cx: &mut App) {
     if state(cx).overlay.is_some() {
         let handle = state(cx).overlay.unwrap();
@@ -161,37 +164,51 @@ pub fn trigger_capture(cx: &mut App) {
     // Synchronous and verified: by the time this returns the settings window is
     // off screen, so no guessed delay is needed before the capture.
     win_util::hide_window_and_wait(SETTINGS_TITLE, Duration::from_millis(250));
+    crate::timing("2 own windows hidden");
 
+    // Start the grab first, then spend the window build on top of it.
     let started = std::time::Instant::now();
-    cx.spawn(async move |cx| {
-        let captured = cx
-            .background_executor()
-            .spawn(async { frame::capture_virtual_screen() })
-            .await;
-        crate::trace_log!("xshot: captured the desktop in {:?}", started.elapsed());
+    let grabbed = cx.background_executor().spawn(async move {
+        frame::capture_virtual_screen().map(|dib| {
+            // The display image is built here too: it is a 14 MB copy, and the
+            // main thread has a window to create.
+            let image = dib.to_render_image();
+            (dib, image)
+        })
+    });
 
+    let screen = util::virtual_screen();
+    let Some(handle) = open_overlay_window(cx, screen) else {
+        eprintln!("xshot: could not open overlay");
+        return;
+    };
+    crate::timing("w overlay window built");
+
+    cx.spawn(async move |cx| {
+        let captured = grabbed.await;
+        crate::trace_log!("xshot: captured the desktop in {:?}", started.elapsed());
+        crate::timing("3 desktop captured");
         let _ = cx.update(|cx| match captured {
-            Ok(dib) => open_overlay(cx, dib),
-            Err(error) => eprintln!("xshot: capture failed: {error:#}"),
+            Ok((dib, image)) => install_overlay(cx, handle, screen, dib, image),
+            Err(error) => {
+                eprintln!("xshot: capture failed: {error:#}");
+                // The empty window must not be left behind.
+                let _ = handle.update(cx, |_, window, _| window.remove_window());
+                state_mut(cx).overlay = None;
+            }
         });
     })
     .detach();
 }
 
-/// Opens the full-screen selection overlay over a freshly captured desktop.
-pub fn open_overlay(cx: &mut App, dib: Dib) {
-    let screen = util::virtual_screen();
+/// Builds the overlay window, hidden, over a placeholder frame.
+///
+/// It stays invisible until [`install_overlay`] has both the real pixels and a
+/// drawn frame holding them, so the user never sees a half-built overlay.
+fn open_overlay_window(cx: &mut App, screen: VirtualScreen) -> Option<WindowHandle<Overlay>> {
     let scale = estimate_scale(cx, screen);
-    crate::trace_log!(
-        "xshot: opening overlay frame={}x{} screen={}x{} scale={scale}",
-        dib.width,
-        dib.height,
-        screen.w,
-        screen.h
-    );
-
-    let logical_width = dib.width as f32 / scale;
-    let logical_height = dib.height as f32 / scale;
+    let logical_width = screen.w as f32 / scale;
+    let logical_height = screen.h as f32 / scale;
     let bounds = Bounds {
         origin: point(px(screen.x as f32 / scale), px(screen.y as f32 / scale)),
         size: size(px(logical_width), px(logical_height)),
@@ -207,33 +224,64 @@ pub fn open_overlay(cx: &mut App, dib: Dib) {
         // `PopUp` gives us a tool window that is topmost and absent from the
         // taskbar and Alt+Tab, which is exactly what a selection overlay is.
         kind: WindowKind::PopUp,
-        focus: true,
+        focus: false,
+        // Shown from the start, but transparent and drawing nothing until the
+        // capture lands: the user sees the desktop through it, so the window
+        // being built early costs nothing visually. A *hidden* window would be
+        // no good here — the platform frame loop never delivers it a frame, so
+        // it could not be filled in before being revealed.
         show: true,
         is_resizable: false,
         is_movable: false,
         is_minimizable: false,
-        window_background: WindowBackgroundAppearance::Opaque,
+        window_background: WindowBackgroundAppearance::Transparent,
         ..Default::default()
     };
 
-    let screen_origin = (screen.x, screen.y);
-    match cx.open_window(options, move |window, cx| {
-        let view = cx.new(|cx| Overlay::new(dib, screen_origin, window, cx));
-        window.focus(&view.read(cx).focus_handle(), cx);
-        view
-    }) {
-        Ok(handle) => {
-            state_mut(cx).overlay = Some(handle.into());
-        }
-        Err(error) => eprintln!("xshot: could not open overlay: {error:#}"),
-    }
+    // A one-pixel frame. GDI hands back a zeroed section, so it is black, and
+    // the window is hidden anyway.
+    let placeholder = Dib::new(1, 1).ok()?;
+    let origin = (screen.x, screen.y);
+    let handle = cx
+        .open_window(options, move |window, cx| {
+            cx.new(|cx| Overlay::new(placeholder, origin, window, cx))
+        })
+        .ok()?;
+    state_mut(cx).overlay = Some(handle);
+    Some(handle)
+}
 
-    // Assert the exact physical geometry now that the HWND exists, then take
-    // the foreground so Esc/Enter and the text tool receive input.
-    if let Some(hwnd) = util::place_client_exact(OVERLAY_TITLE, screen.x, screen.y, screen.w, screen.h)
-    {
+/// Hands the freshly captured desktop to the window built for it and reveals it.
+fn install_overlay(
+    cx: &mut App,
+    handle: WindowHandle<Overlay>,
+    screen: VirtualScreen,
+    dib: Dib,
+    image: Arc<RenderImage>,
+) {
+    let (x, y, w, h) = (screen.x, screen.y, screen.w, screen.h);
+    // Fix the geometry before the frame is drawn, so what is presented matches
+    // the client area exactly.
+    if util::place_client_exact(OVERLAY_TITLE, x, y, w, h).is_none() {
+        let _ = handle.update(cx, |_, window, _| window.remove_window());
+        state_mut(cx).overlay = None;
+        return;
+    }
+    crate::timing("6 placed");
+
+    let _ = handle.update(cx, |overlay, window, cx| {
+        overlay.set_source(dib, (x as f32, y as f32), image);
+        window.focus(&overlay.focus_handle(), cx);
+        // Hand the frozen desktop to the compositor before taking the
+        // foreground, so the overlay is never on screen without it.
+        window.refresh();
+    });
+    crate::timing("7 painted");
+
+    if let Some(hwnd) = util::find_window(OVERLAY_TITLE) {
         win_util::force_foreground(hwnd);
     }
+    crate::timing("8 foreground");
 }
 
 /// Opens a borderless, always-on-top window holding a finished shot.

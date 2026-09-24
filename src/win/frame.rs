@@ -103,9 +103,12 @@ impl Dib {
     /// GPUI's `RenderImage` is `image::RgbaImage` whose bytes are actually in
     /// `BGRA` order, which is exactly the DIB layout, so this is a plain move.
     pub fn to_render_image(&self) -> std::sync::Arc<gpui_kit::RenderImage> {
+        crate::timing("c5 copy start");
         let buffer = image::RgbaImage::from_raw(self.width as u32, self.height as u32, self.pixels().to_vec())
             .expect("DIB dimensions match its buffer length");
-        std::sync::Arc::new(gpui_kit::RenderImage::new(vec![image::Frame::new(buffer)]))
+        let image = std::sync::Arc::new(gpui_kit::RenderImage::new(vec![image::Frame::new(buffer)]));
+        crate::timing("c6 copy done");
+        image
     }
 
     /// Encodes the DIB as PNG bytes.
@@ -152,8 +155,10 @@ pub fn capture_virtual_screen() -> Result<Dib> {
     if screen.is_empty() {
         bail!("no monitor reported a usable virtual screen");
     }
+    crate::timing("c1 virtual screen known");
 
     let mut dib = Dib::new(screen.w, screen.h)?;
+    crate::timing("c2 dib allocated");
     unsafe {
         let dc = GetDC(None);
         let result = BitBlt(
@@ -170,7 +175,9 @@ pub fn capture_virtual_screen() -> Result<Dib> {
         ReleaseDC(None, dc);
         result.context("BitBlt screen capture")?;
     }
+    crate::timing("c3 bitblt done");
     dib.opaque_alpha();
+    crate::timing("c4 alpha done");
     Ok(dib)
 }
 

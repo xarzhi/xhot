@@ -194,6 +194,15 @@ pub struct Overlay {
     colour_copied: Option<std::time::Instant>,
     /// Whether the Shift watcher has been started for this window.
     shift_watcher: bool,
+    /// Whether the first frame has been drawn yet, for the capture timing log.
+    painted: bool,
+    /// Whether the real capture has arrived.
+    ///
+    /// The window is built while the pixels are still being grabbed, and it is
+    /// visible from the moment it exists, so until this flips it draws nothing
+    /// at all and the desktop shows through. Otherwise the user would be looking
+    /// at a black screen for the duration of the grab.
+    ready: bool,
     /// Last time a live mosaic preview was rebuilt, to keep dragging cheap.
     last_mosaic_at: Option<std::time::Instant>,
     shapes: Vec<Shape>,
@@ -248,6 +257,8 @@ impl Overlay {
             colour_hex: true,
             colour_copied: None,
             shift_watcher: false,
+            painted: false,
+            ready: false,
             last_mosaic_at: None,
             shapes: Vec::new(),
             draft: None,
@@ -257,6 +268,42 @@ impl Overlay {
 
     pub fn focus_handle(&self) -> FocusHandle {
         self.focus.clone()
+    }
+
+    /// Installs a fresh capture into a window that was built ahead of it.
+    ///
+    /// The window is created while the pixels are still being grabbed, so it
+    /// starts out holding a placeholder; everything that belongs to a capture is
+    /// set here, and anything the placeholder frame may have accumulated while
+    /// it was invisible is dropped.
+    pub fn set_source(
+        &mut self,
+        source: Dib,
+        screen_origin: (f32, f32),
+        image: Arc<RenderImage>,
+    ) {
+        self.frame_size = (source.width as f32, source.height as f32);
+        self.source = source;
+        self.image = image;
+        self.screen_origin = screen_origin;
+        self.view_size = (self.frame_size.0 / self.scale, self.frame_size.1 / self.scale);
+        self.map = (self.scale, self.scale);
+        self.selection = None;
+        self.hover_rect = None;
+        self.selected_shape = None;
+        self.drag = None;
+        self.shapes.clear();
+        self.draft = None;
+        self.text = None;
+        self.magnifier = None;
+        self.hover_index_at = None;
+        self.colour_copied = None;
+        self.ready = true;
+        crate::trace_log!(
+            "xshot: overlay source installed frame={}x{}",
+            self.frame_size.0,
+            self.frame_size.1
+        );
     }
 
     // -- geometry helpers -------------------------------------------------
@@ -2017,6 +2064,10 @@ impl Render for Overlay {
             self.shift_watcher = true;
             Self::watch_shift(cx);
         }
+        if !self.painted {
+            self.painted = true;
+            crate::timing("6 overlay first paint");
+        }
         self.scale = window.scale_factor();
         let client = window.bounds().size;
         let (client_w, client_h) = (client.width.as_f32(), client.height.as_f32());
@@ -2030,9 +2081,23 @@ impl Render for Overlay {
             .relative()
             .size_full()
             .overflow_hidden()
-            .bg(rgb(0x000000))
+            // Fully transparent until the capture arrives, so the desktop is
+            // what the user sees while this window is being filled in.
+            .bg(if self.ready {
+                rgb(0x000000)
+            } else {
+                rgba(0x0000_0000)
+            })
             .track_focus(&self.focus)
-            .on_key_down(cx.listener(Self::on_key_down))
+            .on_key_down(cx.listener(Self::on_key_down));
+
+        if !self.ready {
+            // Nothing but the empty window: no frozen frame to show yet, and a
+            // dimmed or black screen would be worse than not being there.
+            return root;
+        }
+
+        root = root
             .child(
                 img(self.image.clone())
                     .absolute()

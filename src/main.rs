@@ -17,14 +17,73 @@ macro_rules! trace_log {
     };
 }
 
+/// Phase timing for the capture path, off unless `XSHOT_TIMING` is set.
+///
+/// The walk from hotkey to the frozen screen appearing is the one thing a user
+/// actually feels, and it is made of several parts that live in different
+/// threads. Setting `XSHOT_TIMING=1` appends a timestamped line per phase to
+/// `%TEMP%\xshot-timing.log`, which works on a release build too — the whole
+/// point, since that is the build whose latency matters.
+pub fn timing(label: &str) {    use std::io::Write;
+    use std::sync::{Mutex, OnceLock};
+
+    // The handle is opened once and kept: opening, writing and closing a file
+    // per mark cost more than the phases being measured.
+    static SINK: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
+    static BASE: OnceLock<std::time::Instant> = OnceLock::new();
+    let sink = SINK.get_or_init(|| {
+        if std::env::var_os("XSHOT_TIMING").is_none() {
+            return None;
+        }
+        let path = std::env::temp_dir().join("xshot-timing.log");
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok()
+            .map(Mutex::new)
+    });
+    let Some(sink) = sink else {
+        return;
+    };
+    let base = *BASE.get_or_init(std::time::Instant::now);
+    if let Ok(mut file) = sink.lock() {
+        let _ = writeln!(file, "{:>9.2}ms  {label}", base.elapsed().as_secs_f64() * 1000.0);
+    }
+}
+
 mod annot;
 mod app;
 mod config;
 mod ui;
 mod win;
 
+/// The output path when started as `xshot --export-icon <path>`.
+///
+/// Only used when preparing a release; the app never looks at its arguments
+/// otherwise.
+fn icon_export_path() -> Option<String> {
+    let mut args = std::env::args().skip(1);
+    while let Some(argument) = args.next() {
+        if argument == "--export-icon" {
+            return Some(args.next().unwrap_or_else(|| "assets/icon.ico".to_string()));
+        }
+    }
+    None
+}
+
 fn main() {
     install_panic_log();
+
+    // Build-time utility: materialise the icon that is otherwise only ever drawn
+    // at runtime, for the installer to embed. `xshot --export-icon assets/icon.ico`
+    if let Some(path) = icon_export_path() {
+        match win::icon::write_ico(std::path::Path::new(&path)) {
+            Ok(()) => eprintln!("xshot: wrote {path}"),
+            Err(error) => eprintln!("xshot: could not write {path}: {error:#}"),
+        }
+        return;
+    }
 
     // Must happen before the first window exists, otherwise Windows reports a
     // scaled-down virtual desktop and screenshots come back blurry.
@@ -65,6 +124,9 @@ fn main() {
                         break;
                     };
                     let quitting = command == win::tray::Command::Quit;
+                    if command == win::tray::Command::Capture {
+                        crate::timing("1 command received");
+                    }
                     cx.update(|cx| match command {
                         win::tray::Command::Capture => app::trigger_capture(cx),
                         win::tray::Command::CaptureRegion { x, y, w, h } => {
