@@ -122,6 +122,19 @@ pub fn show_move_cursor() {
     }
 }
 
+/// Restores a maximized window to the size it had before.
+///
+/// GPUI's `zoom_window` is documented as a toggle but its Windows backend calls
+/// `ShowWindow(SW_MAXIMIZE)` unconditionally, so the other half of the toggle
+/// has to happen here.
+pub fn restore_window(title: &str) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{SW_RESTORE, ShowWindowAsync};
+    match find_window(title) {
+        Some(hwnd) => unsafe { ShowWindowAsync(hwnd, SW_RESTORE).ok().is_ok() },
+        None => false,
+    }
+}
+
 /// Asks the user for a folder, starting at `start`.
 ///
 /// `SHBrowseForFolder` is the old shell picker, but it is one call plus one path

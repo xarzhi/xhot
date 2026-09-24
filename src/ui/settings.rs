@@ -10,6 +10,7 @@ use gpui_kit::*;
 
 use crate::app;
 use crate::config::{CloseBehavior, FinishAction, ThemeChoice};
+use crate::ui::icons::{self, glyph};
 use crate::ui::theme::{
     CONTROL_HEIGHT, FONT_FAMILY, NAV_ROW_HEIGHT, RADIUS_CARD, RADIUS_CONTROL, TEXT_BODY,
     TEXT_CAPTION, TEXT_TITLE, Theme,
@@ -206,12 +207,12 @@ fn chord_string(modifiers: Modifiers, key: &str) -> String {
 }
 
 impl Render for Settings {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let config = app::state(cx).config.clone();
         let theme = config.resolved_theme();
         let page = self.page;
 
-        let title_bar = self.title_bar(theme, cx);
+        let title_bar = self.title_bar(window, theme, cx);
         let sidebar = self.sidebar(theme, cx);
         let body = match page {
             Page::General => general_page(&config, theme, cx),
@@ -271,7 +272,7 @@ impl Render for Settings {
 }
 
 impl Settings {
-    fn title_bar(&self, theme: Theme, cx: &mut Context<Self>) -> AnyElement {
+    fn title_bar(&self, window: &Window, theme: Theme, cx: &mut Context<Self>) -> AnyElement {
         div()
             .id("settings-titlebar")
             .flex()
@@ -307,25 +308,32 @@ impl Settings {
             )
             .child(
                 div()
-                    .id("settings-close")
                     .flex()
+                    .flex_row()
                     .items_center()
-                    .justify_center()
-                    .w(px(40.0))
-                    .h(px(30.0))
-                    .rounded(px(RADIUS_CONTROL))
-                    .cursor_pointer()
-                    .text_size(px(TEXT_BODY))
-                    .text_color(theme.text_secondary)
-                    .hover(move |style| style.bg(theme.danger).text_color(theme.window))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|_this, _event, _window, cx| {
-                            cx.stop_propagation();
-                            app::close_settings(cx);
-                        }),
-                    )
-                    .child("✕"),
+                    .gap(px(2.0))
+                    .child(window_button("settings-minimize", glyph::MINIMIZE, theme, cx, |window, _cx| {
+                        window.minimize_window();
+                    }))
+                    .child(window_button(
+                        "settings-maximize",
+                        // Two overlapping squares once it is maximized: the icon
+                        // font's `maximize` is the "make it big" square, and its
+                        // `fuzhi` is the conventional restore shape.
+                        if window.is_maximized() { glyph::RESTORE } else { glyph::MAXIMIZE },
+                        theme,
+                        cx,
+                        |window, _cx| {
+                            if window.is_maximized() {
+                                crate::win::util::restore_window(app::SETTINGS_TITLE);
+                            } else {
+                                window.zoom_window();
+                            }
+                        },
+                    ))
+                    .child(window_button("settings-close", glyph::CLOSE, theme, cx, |_window, cx| {
+                        app::close_settings(cx);
+                    })),
             )
             .into_any_element()
     }
@@ -518,6 +526,45 @@ fn general_page(config: &crate::config::Config, theme: Theme, cx: &mut Context<S
                     config.copy_on_finish = !config.copy_on_finish;
                 })),
         )
+        .into_any_element()
+}
+
+/// One of the three caption buttons in the title bar.
+///
+/// They are ordinary buttons in the title bar rather than a native caption: the
+/// window has no system frame, so Windows has nothing to draw them for us.
+fn window_button(
+    id: &'static str,
+    art: &'static str,
+    theme: Theme,
+    cx: &mut Context<Settings>,
+    act: fn(&mut Window, &mut App),
+) -> AnyElement {
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .justify_center()
+        .w(px(38.0))
+        .h(px(30.0))
+        .rounded(px(RADIUS_CONTROL))
+        .cursor_pointer()
+        .hover(move |style| {
+            // Closing is the one that is allowed to look destructive.
+            if id == "settings-close" {
+                style.bg(theme.danger)
+            } else {
+                style.bg(theme.card_hover)
+            }
+        })
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |_this, _event, window, cx| {
+                cx.stop_propagation();
+                act(window, cx);
+            }),
+        )
+        .child(icons::icon(art, 15.0, theme.text_secondary))
         .into_any_element()
 }
 

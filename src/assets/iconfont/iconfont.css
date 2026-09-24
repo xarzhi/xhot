@@ -1,0 +1,83 @@
+@font-face {
+  font-family: "iconfont"; /* Project id 5238442 */
+  src: url('iconfont.woff2?t=1790240021827') format('woff2'),
+       url('iconfont.woff?t=1790240021827') format('woff'),
+       url('iconfont.ttf?t=1790240021827') format('truetype');
+}
+
+.iconfont {
+  font-family: "iconfont" !important;
+  font-size: 16px;
+  font-style: normal;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+.icon-arrow:before {
+  content: "\e630";
+}
+
+.icon-save:before {
+  content: "\ec09";
+}
+
+.icon-revoke:before {
+  content: "\e6e2";
+}
+
+.icon-fuzhi:before {
+  content: "\e67e";
+}
+
+.icon-pin:before {
+  content: "\e61a";
+}
+
+.icon-rect:before {
+  content: "\e620";
+}
+
+.icon-rubber:before {
+  content: "\ea15";
+}
+
+.icon-copy:before {
+  content: "\e62f";
+}
+
+.icon-mosaic:before {
+  content: "\e749";
+}
+
+.icon-circle:before {
+  content: "\e6c7";
+}
+
+.icon-up-arrow:before {
+  content: "\e642";
+}
+
+.icon-down-arrow:before {
+  content: "\e643";
+}
+
+.icon-minimize:before {
+  content: "\e711";
+}
+
+.icon-close:before {
+  content: "\e609";
+}
+
+.icon-maximize:before {
+  content: "\e655";
+}
+
+.icon-right-arrow:before {
+  content: "\eca7";
+}
+
+.icon-left-arrow:before {
+  content: "\eca8";
+}
+

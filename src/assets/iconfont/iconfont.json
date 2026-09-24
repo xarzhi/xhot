@@ -1,0 +1,128 @@
+{
+  "id": "5238442",
+  "name": "xshot",
+  "font_family": "iconfont",
+  "css_prefix_text": "icon-",
+  "description": "",
+  "glyphs": [
+    {
+      "icon_id": "2279255",
+      "name": "箭头",
+      "font_class": "arrow",
+      "unicode": "e630",
+      "unicode_decimal": 58928
+    },
+    {
+      "icon_id": "4686546",
+      "name": "保存",
+      "font_class": "save",
+      "unicode": "ec09",
+      "unicode_decimal": 60425
+    },
+    {
+      "icon_id": "4890374",
+      "name": "撤销",
+      "font_class": "revoke",
+      "unicode": "e6e2",
+      "unicode_decimal": 59106
+    },
+    {
+      "icon_id": "6539415",
+      "name": "复制",
+      "font_class": "fuzhi",
+      "unicode": "e67e",
+      "unicode_decimal": 59006
+    },
+    {
+      "icon_id": "9713681",
+      "name": "图钉-置顶",
+      "font_class": "pin",
+      "unicode": "e61a",
+      "unicode_decimal": 58906
+    },
+    {
+      "icon_id": "10048835",
+      "name": "矩形",
+      "font_class": "rect",
+      "unicode": "e620",
+      "unicode_decimal": 58912
+    },
+    {
+      "icon_id": "18171135",
+      "name": "橡皮,擦除,橡皮擦",
+      "font_class": "rubber",
+      "unicode": "ea15",
+      "unicode_decimal": 59925
+    },
+    {
+      "icon_id": "21516805",
+      "name": "复制",
+      "font_class": "copy",
+      "unicode": "e62f",
+      "unicode_decimal": 58927
+    },
+    {
+      "icon_id": "35585503",
+      "name": "马赛克",
+      "font_class": "mosaic",
+      "unicode": "e749",
+      "unicode_decimal": 59209
+    },
+    {
+      "icon_id": "47498599",
+      "name": "圆形",
+      "font_class": "circle",
+      "unicode": "e6c7",
+      "unicode_decimal": 59079
+    },
+    {
+      "icon_id": "7801438",
+      "name": "亮色版本_分页器向后",
+      "font_class": "up-arrow",
+      "unicode": "e642",
+      "unicode_decimal": 58946
+    },
+    {
+      "icon_id": "7801439",
+      "name": "亮色版本_分页器向前",
+      "font_class": "down-arrow",
+      "unicode": "e643",
+      "unicode_decimal": 58947
+    },
+    {
+      "icon_id": "9974760",
+      "name": "减",
+      "font_class": "minimize",
+      "unicode": "e711",
+      "unicode_decimal": 59153
+    },
+    {
+      "icon_id": "11390192",
+      "name": "close",
+      "font_class": "close",
+      "unicode": "e609",
+      "unicode_decimal": 58889
+    },
+    {
+      "icon_id": "12323755",
+      "name": "全屏",
+      "font_class": "maximize",
+      "unicode": "e655",
+      "unicode_decimal": 58965
+    },
+    {
+      "icon_id": "46331510",
+      "name": "亮色版本_分页器向前-copy",
+      "font_class": "right-arrow",
+      "unicode": "eca7",
+      "unicode_decimal": 60583
+    },
+    {
+      "icon_id": "46331511",
+      "name": "亮色版本_分页器向前-copy-copy",
+      "font_class": "left-arrow",
+      "unicode": "eca8",
+      "unicode_decimal": 60584
+    }
+  ]
+}

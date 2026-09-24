@@ -116,6 +116,9 @@ fn main() {
         .with_quit_mode(gpui_kit::QuitMode::Explicit)
         .run(move |cx| {
             gpui_kit::init(cx);
+            // The icon font has to be registered before the first window draws,
+            // or every icon comes out as a fallback glyph.
+            ui::icons::load(cx);
             let silent = configuration.silent_start;
             cx.set_global(app::AppState::new(configuration));
 

@@ -136,6 +136,134 @@ struct Magnifier {
     image: Arc<RenderImage>,
 }
 
+/// Largest corner radius the slider offers, in logical pixels.
+const RADIUS_MAX: f32 = 48.0;
+
+/// The two numbers behind the size badge, while they are being edited.///
+/// Numeric only, so the digits are read straight from the key events and no IME
+/// or text-input plumbing is involved.
+struct SizeEdit {
+    width: String,
+    height: String,
+    /// Which of the two the next digit goes into.
+    on_height: bool,
+    /// The active field still holds the value it opened with, so the first digit
+    /// typed replaces it instead of appending to it — nobody wants to backspace
+    /// "500" before typing "300".
+    fresh: bool,
+}
+
+impl SizeEdit {
+    fn open(selection: Rect, map: (f32, f32)) -> Self {
+        Self {
+            width: format!("{:.0}", selection.w * map.0),
+            height: format!("{:.0}", selection.h * map.1),
+            on_height: false,
+            fresh: true,
+        }
+    }
+
+    fn field_mut(&mut self) -> &mut String {
+        if self.on_height {
+            &mut self.height
+        } else {
+            &mut self.width
+        }
+    }
+
+    /// Whether this key belongs to the editor, in which case it is consumed.
+    fn handle_key(&mut self, key: &str) -> Action2 {
+        match key {
+            "escape" => return Action2::Close,
+            "enter" => return Action2::Apply,
+            "tab" => {
+                self.on_height = !self.on_height;
+                self.fresh = true;
+                return Action2::Redraw;
+            }
+            "backspace" => {
+                self.fresh = false;
+                self.field_mut().pop();
+                return Action2::Redraw;
+            }
+            _ => {}
+        }
+        if key.len() == 1 && key.chars().all(|c| c.is_ascii_digit()) {
+            if self.fresh {
+                self.field_mut().clear();
+                self.fresh = false;
+            }
+            let field = self.field_mut();
+            // Four digits is every display there is; more would be a typo.
+            if field.len() < 4 {
+                field.push_str(key);
+            }
+            return Action2::Redraw;
+        }
+        Action2::Redraw
+    }
+}
+
+/// What the editor wants done with a key press.
+enum Action2 {
+    Redraw,
+    Apply,
+    Close,
+}
+
+/// Which way an arrow key points.
+#[derive(Clone, Copy)]
+enum Step {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+impl Step {
+    fn from_key(key: &str) -> Option<Self> {
+        match key {
+            "left" => Some(Step::Left),
+            "right" => Some(Step::Right),
+            "up" => Some(Step::Up),
+            "down" => Some(Step::Down),
+            _ => None,
+        }
+    }
+}
+
+/// Moves a rectangle one pixel, kept inside the view.
+fn nudge(rect: Rect, step: Step, view_w: f32, view_h: f32) -> Rect {
+    let (dx, dy) = match step {
+        Step::Left => (-1.0, 0.0),
+        Step::Right => (1.0, 0.0),
+        Step::Up => (0.0, -1.0),
+        Step::Down => (0.0, 1.0),
+    };
+    Rect::new(
+        (rect.x + dx).clamp(0.0, (view_w - rect.w).max(0.0)),
+        (rect.y + dy).clamp(0.0, (view_h - rect.h).max(0.0)),
+        rect.w,
+        rect.h,
+    )
+}
+
+/// Grows a rectangle one pixel towards `step`, the opposite edge staying put.
+fn grow(rect: Rect, step: Step, view_w: f32, view_h: f32) -> Rect {
+    match step {
+        Step::Left => {
+            let x = (rect.x - 1.0).max(0.0);
+            Rect::new(x, rect.y, rect.w + (rect.x - x), rect.h)
+        }
+        Step::Right => Rect::new(rect.x, rect.y, (rect.w + 1.0).min(view_w - rect.x), rect.h),
+        Step::Up => {
+            let y = (rect.y - 1.0).max(0.0);
+            Rect::new(rect.x, y, rect.w, rect.h + (rect.y - y))
+        }
+        Step::Down => Rect::new(rect.x, rect.y, rect.w, (rect.h + 1.0).min(view_h - rect.y)),
+    }
+}
+
 pub struct Overlay {
     /// The frozen desktop, kept around for the final GDI composite.
     source: Dib,
@@ -203,11 +331,67 @@ pub struct Overlay {
     /// at all and the desktop shows through. Otherwise the user would be looking
     /// at a black screen for the duration of the grab.
     ready: bool,
+    /// Corner radius applied to the finished shot, in logical pixels.
+    radius: f32,
+    /// Where the radius slider's track sits, so a drag can be turned back into a
+    /// value. `(top, height)` in overlay logical pixels.
+    radius_track: (f32, f32),
+    /// Whether the radius slider is being dragged.
+    radius_drag: bool,
+    /// The width/height editor opened from the size badge, if it is up.
+    size_edit: Option<SizeEdit>,
     /// Last time a live mosaic preview was rebuilt, to keep dragging cheap.
     last_mosaic_at: Option<std::time::Instant>,
     shapes: Vec<Shape>,
     draft: Option<Shape>,
     text: Option<TextEdit>,
+}
+
+/// Which icon a toolbar button shows.
+///
+/// The icon font covers the tools and the actions; the pencil and the text tool
+/// are stroked by hand (see [`crate::ui::icons::Drawn`]) because the set has no
+/// glyph for them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Art {
+    Tool(Tool),
+    Undo,
+    Pin,
+    Save,
+    Copy,
+    Cancel,
+}
+
+impl Art {
+    /// A stable element id — the label used to serve as one.
+    fn id(self) -> &'static str {
+        match self {
+            Art::Tool(tool) => tool.label(),
+            Art::Undo => "撤销",
+            Art::Pin => "钉图",
+            Art::Save => "保存",
+            Art::Copy => "复制",
+            Art::Cancel => "取消",
+        }
+    }
+
+    fn element(self, size: f32, color: Rgba) -> AnyElement {
+        use crate::ui::icons::{self, Drawn, glyph};
+        match self {
+            Art::Tool(Tool::Rect) => icons::icon(glyph::RECT, size, color),
+            Art::Tool(Tool::Ellipse) => icons::icon(glyph::CIRCLE, size, color),
+            Art::Tool(Tool::Arrow) => icons::icon(glyph::ARROW, size, color),
+            Art::Tool(Tool::Pen) => icons::drawn(Drawn::Pen, size, color),
+            Art::Tool(Tool::Mosaic) => icons::icon(glyph::MOSAIC, size, color),
+            Art::Tool(Tool::Eraser) => icons::icon(glyph::RUBBER, size, color),
+            Art::Tool(Tool::Text) => icons::drawn(Drawn::Text, size, color),
+            Art::Undo => icons::icon(glyph::REVOKE, size, color),
+            Art::Pin => icons::icon(glyph::PIN, size, color),
+            Art::Save => icons::icon(glyph::SAVE, size, color),
+            Art::Copy => icons::icon(glyph::COPY, size, color),
+            Art::Cancel => icons::icon(glyph::CLOSE, size, color),
+        }
+    }
 }
 
 impl Overlay {
@@ -259,6 +443,10 @@ impl Overlay {
             shift_watcher: false,
             painted: false,
             ready: false,
+            radius: app::state(cx).config.corner_radius.clamp(0.0, 96.0),
+            radius_track: (0.0, 0.0),
+            radius_drag: false,
+            size_edit: None,
             last_mosaic_at: None,
             shapes: Vec::new(),
             draft: None,
@@ -448,6 +636,9 @@ impl Overlay {
         };
         let offset = self.composite_offset((origin_x, origin_y));
         paint::draw_shapes(&mut output, &self.shapes, map, offset);
+        // Rounding happens last, on the composited shot: it is the shape of the
+        // file, not a decoration on the annotations.
+        paint::round_corners(&mut output, (self.radius * map.0).round() as i32);
 
         match mode {
             Finish::Copy => {
@@ -681,6 +872,13 @@ impl Overlay {
         self.pointer = Some(position);
         self.refresh_magnifier();
 
+        // The pointer is one thing while the radius slider is being dragged; the
+        // selection must not move along with it.
+        if self.radius_drag {
+            self.drag_radius(event.position.y, cx);
+            return;
+        }
+
         let Some(drag) = self.drag.clone() else {
             // Idle: keep the pointer honest about what is under it — a resize
             // arrow over a handle, a move pointer over something draggable —
@@ -792,6 +990,11 @@ impl Overlay {
     }
 
     fn on_mouse_up(&mut self, event: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.radius_drag {
+            self.radius_drag = false;
+            cx.notify();
+            return;
+        }
         let position = self.local(event.position);
         let Some(drag) = self.drag.take() else {
             return;
@@ -1277,6 +1480,40 @@ impl Overlay {
             return;
         }
 
+        // The size editor owns the keyboard while it is up: every key is either
+        // a digit or one of its few commands, and nothing must reach the tools.
+        if self.size_edit.is_some() {
+            let action = self
+                .size_edit
+                .as_mut()
+                .map(|edit| edit.handle_key(key))
+                .unwrap_or(Action2::Close);
+            match action {
+                Action2::Apply => self.apply_size_edit(cx),
+                Action2::Close => {
+                    self.size_edit = None;
+                    cx.notify();
+                }
+                Action2::Redraw => cx.notify(),
+            }
+            return;
+        }
+
+        // Arrow keys nudge the region a pixel at a time; with Ctrl they grow it
+        // one pixel towards that arrow instead.
+        if let Some(step) = Step::from_key(key) {
+            if let Some(selection) = self.selection {
+                let (view_w, view_h) = self.view_size();
+                self.selection = Some(if event.keystroke.modifiers.control {
+                    grow(selection, step, view_w, view_h)
+                } else {
+                    nudge(selection, step, view_w, view_h)
+                });
+                cx.notify();
+            }
+            return;
+        }
+
         // Modifier combinations first, so that `Ctrl+P` is not also read as the
         // plain `p` pencil shortcut.
         if event.keystroke.modifiers.control {
@@ -1313,9 +1550,37 @@ impl Overlay {
         }
     }
 
+    /// Takes the numbers from the size editor and resizes the region to match.
+    ///
+    /// The size is what the badge showed — device pixels — so it is converted
+    /// back through the same mapping the badge used.
+    fn apply_size_edit(&mut self, cx: &mut Context<Self>) {
+        let Some(edit) = self.size_edit.take() else {
+            return;
+        };
+        let Some(current) = self.selection else {
+            cx.notify();
+            return;
+        };
+        let (view_w, view_h) = self.view_size();
+        let width = edit.width.parse::<f32>().unwrap_or(current.w * self.map.0);
+        let height = edit.height.parse::<f32>().unwrap_or(current.h * self.map.1);
+        let logical_w = (width / self.map.0).clamp(1.0, view_w - current.x);
+        let logical_h = (height / self.map.1).clamp(1.0, view_h - current.y);
+        self.selection = Some(Rect::new(current.x, current.y, logical_w, logical_h));
+        cx.notify();
+    }
+
+    /// Sets the corner radius and remembers it for the next shot.
+    fn set_radius(&mut self, radius: f32, cx: &mut Context<Self>) {
+        self.radius = radius.clamp(0.0, 96.0);
+        let value = self.radius;
+        app::update_config(cx, |config| config.corner_radius = value);
+        cx.notify();
+    }
+
     /// Arms a tool, or disarms it if it was already armed.
-    fn arm(&mut self, tool: Tool, window: &mut Window, cx: &mut Context<Self>) {
-        self.commit_text(window, cx);
+    fn arm(&mut self, tool: Tool, window: &mut Window, cx: &mut Context<Self>) {        self.commit_text(window, cx);
         self.tool = if self.tool == Some(tool) { None } else { Some(tool) };
         cx.notify();
     }
@@ -1639,6 +1904,9 @@ impl Overlay {
                 .h(px(selection.h))
                 .border_1()
                 .border_color(rgb(0x1E88E5))
+                // Doubles as the preview of the corner radius: it is exactly the
+                // shape the finished shot will be cut to.
+                .rounded(px(self.radius))
                 .into_any_element(),
         );
 
@@ -1657,28 +1925,334 @@ impl Overlay {
             );
         }
 
-        // Size badge, above the selection when there is room for it.
-        let label_y = if selection.y >= 24.0 { selection.y - 22.0 } else { selection.y + 2.0 };
-        elements.push(
-            div()
-                .absolute()
-                .left(px(selection.x))
-                .top(px(label_y))
-                .px(px(6.0))
-                .py(px(2.0))
-                .rounded(px(3.0))
-                .bg(rgba(0x0000_00CC))
-                .text_size(px(12.0))
-                .text_color(rgb(0xFFFFFF))
-                .child(format!(
-                    "{:.0} × {:.0}",
-                    selection.w * self.map.0,
-                    selection.h * self.map.1
-                ))
-                .into_any_element(),
-        );
-
         elements
+    }
+
+    /// The corner pieces a radius cuts away, painted like the outside of the
+    /// selection so the shape of the finished shot is visible while framing.
+    ///
+    /// Without this the region still looks like a rectangle: the mask punches a
+    /// square hole, and the four corner triangles keep the frozen desktop at full
+    /// brightness, which reads as "this part is included".
+    fn radius_corners(&self) -> Option<AnyElement> {
+        let selection = self.selection?;
+        let radius = self.radius;
+        if radius < 0.5 {
+            return None;
+        }
+        let radius = radius.min(selection.w / 2.0).min(selection.h / 2.0);
+        let dim = self.dim;
+        Some(
+            canvas(
+                |_, _, _| (),
+                move |_bounds, _, window, _cx| {
+                    // The same 4-arc Bezier approximation the ellipse annotation
+                    // uses, one quarter turn per corner.
+                    const KAPPA: f32 = 0.552_284_75;
+                    let k = radius * KAPPA;
+                    let (x, y) = (selection.x, selection.y);
+                    let (right, bottom) = (selection.right(), selection.bottom());
+                    let corners: [(Pt, Pt, Pt, Pt, Pt); 4] = [
+                        // start, control 1, control 2, end, corner
+                        (
+                            Pt::new(x + radius, y),
+                            Pt::new(x + radius - k, y),
+                            Pt::new(x, y + radius - k),
+                            Pt::new(x, y + radius),
+                            Pt::new(x, y),
+                        ),
+                        (
+                            Pt::new(right - radius, y),
+                            Pt::new(right - radius + k, y),
+                            Pt::new(right, y + radius - k),
+                            Pt::new(right, y + radius),
+                            Pt::new(right, y),
+                        ),
+                        (
+                            Pt::new(right, bottom - radius),
+                            Pt::new(right, bottom - radius + k),
+                            Pt::new(right - radius + k, bottom),
+                            Pt::new(right - radius, bottom),
+                            Pt::new(right, bottom),
+                        ),
+                        (
+                            Pt::new(x, bottom - radius),
+                            Pt::new(x, bottom - radius + k),
+                            Pt::new(x + radius - k, bottom),
+                            Pt::new(x + radius, bottom),
+                            Pt::new(x, bottom),
+                        ),
+                    ];
+                    for (start, c1, c2, end, corner) in corners {
+                        let mut builder = PathBuilder::fill();
+                        builder.move_to(point(px(corner.x), px(corner.y)));
+                        builder.line_to(point(px(start.x), px(start.y)));
+                        builder.cubic_bezier_to(
+                            point(px(end.x), px(end.y)),
+                            point(px(c1.x), px(c1.y)),
+                            point(px(c2.x), px(c2.y)),
+                        );
+                        builder.close();
+                        if let Ok(path) = builder.build() {
+                            window.paint_path(path, rgba((dim * 255.0) as u32));
+                        }
+                    }
+                },
+            )
+            .absolute()
+            .left_0()
+            .top_0()
+            .w_full()
+            .h_full()
+            .into_any_element(),
+        )
+    }
+
+    /// The size badge and its editor.
+    ///
+    /// Separate from the rest of the chrome because both are clickable, and
+    /// clickable chrome has to be added above the capture surface.
+    fn size_badge(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let selection = self.selection?;
+        let label_y = if selection.y >= 24.0 { selection.y - 22.0 } else { selection.y + 2.0 };
+        let mut column = div()
+            .absolute()
+            .left(px(selection.x))
+            .top(px(label_y))
+            .flex()
+            .flex_col()
+            .gap(px(4.0))
+            .child(
+                div()
+                    .id("xshot-size-badge")
+                    .px(px(6.0))
+                    .py(px(2.0))
+                    .rounded(px(3.0))
+                    .bg(rgba(0x0000_00CC))
+                    .text_size(px(12.0))
+                    .text_color(rgb(0xFFFFFF))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgba(0x1E88_5EE6)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _event, _window, cx| {
+                            this.size_edit = this
+                                .selection
+                                .map(|selection| SizeEdit::open(selection, this.map));
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    )
+                    .child(format!(
+                        "{:.0} × {:.0}",
+                        selection.w * self.map.0,
+                        selection.h * self.map.1
+                    )),
+            );
+        if let Some(edit) = &self.size_edit {
+            column = column.child(self.size_editor(edit, cx));
+        }
+        Some(column.into_any_element())
+    }
+
+    /// The little width/height form that drops out of the size badge.
+    fn size_editor(&self, edit: &SizeEdit, cx: &mut Context<Self>) -> AnyElement {
+        let field = |label: &'static str, value: &str, active: bool| -> AnyElement {
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.0))
+                .child(
+                    div()
+                        .w(px(18.0))
+                        .text_size(px(11.5))
+                        .text_color(rgba(0xFFFF_FFB3))
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .w(px(64.0))
+                        .h(px(22.0))
+                        .px(px(6.0))
+                        .rounded(px(3.0))
+                        .bg(rgba(0x0000_0080))
+                        .border_1()
+                        .border_color(if active { rgb(0x1E88E5) } else { rgba(0xFFFF_FF33) })
+                        .text_size(px(12.0))
+                        .text_color(rgb(0xFFFFFF))
+                        .child(value.to_string()),
+                )
+                .into_any_element()
+        };
+
+        div()
+            .id("xshot-size-editor")
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .p(px(8.0))
+            .rounded(px(5.0))
+            .bg(rgba(0x1E1E_1EF2))
+            .border_1()
+            .border_color(rgba(0xFFFF_FF33))
+            .shadow_lg()
+            .cursor_default()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_this, _event, _window, cx| cx.stop_propagation()),
+            )
+            .child(field("宽", &edit.width, !edit.on_height))
+            .child(field("高", &edit.height, edit.on_height))
+            .child(
+                div()
+                    .text_size(px(10.5))
+                    .text_color(rgba(0xFFFF_FF99))
+                    .child("Tab 切换 · Enter 应用 · Esc 取消"),
+            )
+            .into_any_element()
+    }
+
+    /// The corner-radius bar that sits to the right of the region.
+    ///
+    /// Rounding only exists in the finished file, so the bar carries a live
+    /// preview of it: a square cut with the current radius, and a slider to drag
+    /// the value rather than a row of presets to pick from.
+    fn radius_bar(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let selection = self.selection?;
+        let (view_w, view_h) = self.view_size();
+        const WIDTH: f32 = 40.0;
+        /// Tallest radius the slider reaches, in logical pixels.
+        const MAX_RADIUS: f32 = 48.0;
+        const TRACK: f32 = 150.0;
+        /// Where the track starts inside the bar.
+        const TRACK_TOP: f32 = 62.0;
+
+        // Outside the right edge when there is room, otherwise tucked inside it.
+        let left = if selection.right() + WIDTH + 8.0 <= view_w {
+            selection.right() + 8.0
+        } else {
+            (selection.right() - WIDTH - 8.0).max(0.0)
+        };
+        let bar_height = TRACK_TOP + TRACK + 16.0;
+        let top = selection.y.clamp(0.0, (view_h - bar_height).max(0.0));
+
+        // Remembered so the drag handler can turn a pointer position back into a
+        // radius without duplicating the layout.
+        self.radius_track = (top + TRACK_TOP, TRACK);
+
+        let filled = (self.radius / MAX_RADIUS).clamp(0.0, 1.0);
+        let knob_y = (1.0 - filled) * TRACK;
+
+        Some(
+            div()
+                .id("xshot-radius-bar")
+                .absolute()
+                .left(px(left))
+                .top(px(top))
+                .flex()
+                .flex_col()
+                .items_center()
+                .w(px(WIDTH))
+                .p(px(4.0))
+                .rounded(px(6.0))
+                .bg(rgba(0x1E1E_1EF2))
+                .border_1()
+                .border_color(rgba(0xFFFF_FF26))
+                .shadow_lg()
+                // Live preview of the shape the shot will be cut to.
+                .child(
+                    div()
+                        .w(px(22.0))
+                        .h(px(22.0))
+                        .rounded(px(self.radius / 2.0))
+                        .bg(rgb(0xFFFFFF)),
+                )
+                .child(
+                    div()
+                        .pt(px(2.0))
+                        .text_size(px(10.0))
+                        .text_color(rgba(0xFFFF_FFB3))
+                        .child(format!("{:.0}", self.radius)),
+                )
+                .child(
+                    // The track. Its own height is fixed, and where the pointer
+                    // lands on it is what the drag reads.
+                    div()
+                        .id("xshot-radius-slider")
+                        .relative()
+                        .w(px(20.0))
+                        .h(px(TRACK))
+                        .mt(px(TRACK_TOP - 46.0))
+                        .flex()
+                        .justify_center()
+                        .cursor_pointer()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, event: &MouseDownEvent, _window, cx| {
+                                this.drag_radius(event.position.y, cx);
+                                this.radius_drag = true;
+                                cx.stop_propagation();
+                            }),
+                        )
+                        .child(
+                            div()
+                                .absolute()
+                                .left(px(8.0))
+                                .top_0()
+                                .w(px(4.0))
+                                .h(px(TRACK))
+                                .rounded(px(2.0))
+                                .bg(rgba(0xFFFF_FF33)),
+                        )
+                        .child(
+                            div()
+                                .absolute()
+                                .left(px(8.0))
+                                .top(px(knob_y))
+                                .w(px(4.0))
+                                .h(px(TRACK - knob_y))
+                                .rounded(px(2.0))
+                                .bg(rgb(0x1E88E5)),
+                        )
+                        .child(
+                            div()
+                                .absolute()
+                                .left(px(3.0))
+                                .top(px(knob_y - 7.0))
+                                .w(px(14.0))
+                                .h(px(14.0))
+                                .rounded(px(7.0))
+                                .bg(rgb(0xFFFFFF))
+                                .border_1()
+                                .border_color(rgb(0x1E88E5)),
+                        ),
+                )
+                .child(
+                    div()
+                        .pt(px(2.0))
+                        .text_size(px(9.0))
+                        .text_color(rgba(0xFFFF_FF80))
+                        .child("拖动"),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// Sets the radius from a pointer position on the slider.
+    fn drag_radius(&mut self, window_y: Pixels, cx: &mut Context<Self>) {
+        let (track_top, track) = self.radius_track;
+        if track <= 0.0 {
+            return;
+        }
+        // Mouse positions arrive in the same logical pixels the track is
+        // measured in.
+        let position = window_y.as_f32();
+        let fraction = ((position - track_top) / track).clamp(0.0, 1.0);
+        let radius = ((1.0 - fraction) * RADIUS_MAX).round();
+        self.set_radius(radius, cx);
     }
 
     /// Mosaic strokes, shown as bitmaps rather than vectors.
@@ -1799,8 +2373,7 @@ impl Overlay {
         )
     }
 
-    fn toolbar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let selection = self.selection?;
+    fn toolbar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {        let selection = self.selection?;
         // Held back until the region is settled. During the initial drag the
         // toolbar would be chasing the pointer and sitting on top of exactly the
         // part of the screen the user is still framing.
@@ -1823,17 +2396,18 @@ impl Overlay {
         let color = self.color;
         let width = self.width;
 
-        let group = |label: &'static str, active: bool, action: Action| -> AnyElement {
+        // Icon buttons. The labels survive as tooltips-free affordances: the
+        // glyphs are the standard ones for these tools, and the hint line on the
+        // right still spells out what the armed tool does.
+        let group = |art: Art, active: bool, action: Action| -> AnyElement {
             div()
-                .id(label)
+                .id(art.id())
                 .flex()
                 .items_center()
                 .justify_center()
+                .w(px(28.0))
                 .h(px(24.0))
-                .px(px(8.0))
                 .rounded(px(4.0))
-                .text_size(px(12.0))
-                .text_color(if active { rgb(0xFFFFFF) } else { rgb(0xD8D8D8) })
                 .bg(if active { rgb(0x1E88E5) } else { rgba(0x0000_0000) })
                 .cursor_pointer()
                 .hover(|style| style.bg(rgb(0x3C3C3C)))
@@ -1844,7 +2418,7 @@ impl Overlay {
                         cx.stop_propagation();
                     }),
                 )
-                .child(label)
+                .child(art.element(16.0, if active { rgb(0xFFFFFF) } else { rgb(0xD8D8D8) }))
                 .into_any_element()
         };
 
@@ -1858,7 +2432,7 @@ impl Overlay {
             Tool::Text,
         ]
         .into_iter()
-        .map(|tool| group(tool.label(), armed == Some(tool), Action::Arm(tool)))
+        .map(|tool| group(Art::Tool(tool), armed == Some(tool), Action::Arm(tool)))
         .collect();
 
         let swatches: Vec<AnyElement> = PALETTE
@@ -2000,11 +2574,11 @@ impl Overlay {
         }
 
         let actions = vec![
-            group("撤销", false, Action::Undo),
-            group("钉图", false, Action::Pin),
-            group("保存", false, Action::Save),
-            group("复制", false, Action::Copy),
-            group("取消", false, Action::Cancel),
+            group(Art::Undo, false, Action::Undo),
+            group(Art::Pin, false, Action::Pin),
+            group(Art::Save, false, Action::Save),
+            group(Art::Copy, false, Action::Copy),
+            group(Art::Cancel, false, Action::Cancel),
         ];
 
         // A one-line reminder of what the armed tool does.
@@ -2118,6 +2692,7 @@ impl Render for Overlay {
             .children(self.text_elements())
             .children(self.selection_chrome())
             .children(self.shape_chrome())
+            .children(self.radius_corners())
             .children(self.hover_chrome())
             .children(self.brush_circle())
             .children(self.magnifier_panel());
@@ -2142,6 +2717,12 @@ impl Render for Overlay {
                 .on_mouse_move(cx.listener(Self::on_mouse_move))
                 .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up)),
         );
+
+        // Everything clickable goes *above* the capture surface: it is a
+        // full-window hit area, so anything painted before it would never see a
+        // click. The size badge and the radius bar are only chrome with
+        // handlers, so they are added here rather than with the rest of it.
+        root = root.children(self.size_badge(cx)).children(self.radius_bar(cx));
 
         if let Some(toolbar) = self.toolbar(cx) {
             root = root.child(toolbar);

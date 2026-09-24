@@ -110,6 +110,8 @@ pub struct Config {
     pub autostart: bool,
     /// Start without opening the settings window — just the tray icon.
     pub silent_start: bool,
+    /// Corner radius of the finished shot, in logical pixels.
+    pub corner_radius: f32,
 
     // -- 外观 ---------------------------------------------------------------
     pub theme: ThemeChoice,
@@ -144,6 +146,7 @@ impl Default for Config {
             // A screenshot tool lives in the tray; showing the settings window
             // on every login would be noise.
             silent_start: true,
+            corner_radius: 0.0,
             theme: ThemeChoice::default(),
             pin_shadow: true,
             finish_action: FinishAction::default(),

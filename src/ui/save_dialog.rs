@@ -368,8 +368,15 @@ impl Render for SaveDialog {
 ///
 /// `Dib` holds BGRA, which is exactly what `RenderImage` wants, so this is a
 /// copy either way; doing it once here keeps the render path free of pixel work.
+///
+/// Corners a radius cut away are drawn over a checkerboard rather than left
+/// transparent or filled in: transparent pixels would just take the window's
+/// colour behind them, and filling them in would show exactly the square shot
+/// the radius exists to avoid. A checkerboard is the one convention for "this is
+/// see-through".
 fn preview_image(pixels: &Dib) -> Arc<RenderImage> {
     const BOX: f32 = 520.0;
+    const CHECKER: i32 = 8;
     let (width, height) = (pixels.width as f32, pixels.height as f32);
     let scale = (BOX / width).min(BOX / height).min(1.0);
     let target_w = (width * scale).round().max(1.0) as u32;
@@ -383,10 +390,21 @@ fn preview_image(pixels: &Dib) -> Arc<RenderImage> {
         for x in 0..target_w {
             let source_x = ((x as f32 / scale) as usize).min(pixels.width as usize - 1);
             let index = source_y * stride + source_x * 4;
+            let alpha = source[index + 3] as f32 / 255.0;
+            let light = ((x as i32 / CHECKER) + (y as i32 / CHECKER)) % 2 == 0;
+            let behind = if light { 0x66u8 } else { 0x4Au8 };
+            let blend = |channel: u8| -> u8 {
+                (channel as f32 * alpha + behind as f32 * (1.0 - alpha)).round() as u8
+            };
             buffer.put_pixel(
                 x,
                 y,
-                image::Rgba([source[index], source[index + 1], source[index + 2], 0xFF]),
+                image::Rgba([
+                    blend(source[index + 2]),
+                    blend(source[index + 1]),
+                    blend(source[index]),
+                    0xFF,
+                ]),
             );
         }
     }

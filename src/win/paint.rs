@@ -202,6 +202,45 @@ fn draw_shape(dib: &mut Dib, shape: &Shape, scale: (f32, f32), offset: (f32, f32
     }
 }
 
+/// Rounds the corners of a finished shot, leaving the outside transparent.
+///
+/// The alpha fades over roughly one pixel at the arc so the corner is
+/// antialiased rather than stair-stepped. `radius` is in device pixels; zero
+/// leaves the bitmap exactly as it was.
+pub fn round_corners(dib: &mut Dib, radius: i32) {
+    if radius <= 0 {
+        return;
+    }
+    let (width, height) = (dib.width, dib.height);
+    let radius = radius.min(width / 2).min(height / 2);
+    if radius <= 0 {
+        return;
+    }
+    let radius_f = radius as f32;
+    let last = (radius - 1) as f32;
+    let (right, bottom) = ((width - 1) as f32, (height - 1) as f32);
+    let stride = width as usize * 4;
+    let pixels = dib.pixels_mut();
+    for y in 0..height {
+        for x in 0..width {
+            // Distance from the pixel centre to the rounded rectangle: zero
+            // along the straight edges, growing only inside the four corners.
+            let dx = (last - x as f32).max(x as f32 - (right - last)).max(0.0);
+            let dy = (last - y as f32).max(y as f32 - (bottom - last)).max(0.0);
+            if dx <= 0.0 || dy <= 0.0 {
+                continue;
+            }
+            let distance = (dx * dx + dy * dy).sqrt();
+            let coverage = (radius_f - distance + 0.5).clamp(0.0, 1.0);
+            if coverage >= 1.0 {
+                continue;
+            }
+            let index = y as usize * stride + x as usize * 4;
+            pixels[index + 3] = (255.0 * coverage) as u8;
+        }
+    }
+}
+
 /// Pixelates everything within `brush` pixels of a freehand stroke.
 ///
 /// Only the cells the brush actually covers are touched, so this behaves like

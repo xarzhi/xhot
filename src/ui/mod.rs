@@ -1,5 +1,6 @@
 //! GPUI views.
 
+pub mod icons;
 pub mod overlay;
 pub mod pin;
 pub mod pin_menu;
