@@ -1,0 +1,112 @@
+//! xshot — a small, fast Windows screenshot tool built on GPUI.
+//!
+//! GPUI owns every window and all interaction. Win32 is used only where a UI
+//! toolkit cannot reach: grabbing screen pixels, the notification area, the
+//! global hotkey and the clipboard bitmap formats.
+
+// No console window in release builds; debug builds keep it for diagnostics.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+/// Progress logging that is compiled out of release builds entirely.
+#[macro_export]
+macro_rules! trace_log {
+    ($($arg:tt)*) => {
+        if cfg!(debug_assertions) {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
+mod annot;
+mod app;
+mod config;
+mod ui;
+mod win;
+
+fn main() {
+    install_panic_log();
+
+    // Must happen before the first window exists, otherwise Windows reports a
+    // scaled-down virtual desktop and screenshots come back blurry.
+    win::util::set_dpi_awareness();
+
+    let configuration = config::Config::load();
+
+    let (commands, receiver) = async_channel::unbounded::<win::tray::Command>();
+    let capture_hotkey = win::hotkey::parse(&configuration.hotkey_capture);
+    let restore_hotkey = win::hotkey::parse(&configuration.hotkey_restore_pin);
+    if let Err(error) = win::tray::spawn(
+        commands,
+        capture_hotkey,
+        restore_hotkey,
+        configuration.ctrl_drag_pin,
+    ) {
+        eprintln!("xshot: tray thread failed to start: {error}");
+    }
+
+    // GPUI's default quit mode on Windows is `LastWindowClosed`, which would
+    // end the process the moment the settings window is closed — that is
+    // precisely the "minimize to tray" case, and tearing the platform down
+    // under a pending task is not a survivable state. xshot decides for itself
+    // when to exit, so the mode is explicit.
+    gpui_kit::application()
+        .with_quit_mode(gpui_kit::QuitMode::Explicit)
+        .run(move |cx| {
+            gpui_kit::init(cx);
+            cx.set_global(app::AppState::new(configuration));
+
+            app::open_settings(cx);
+
+            // The tray thread never touches the UI directly; it posts commands
+            // here and this task wakes the moment one arrives.
+            cx.spawn(async move |cx| {
+                loop {
+                    let Ok(command) = receiver.recv().await else {
+                        break;
+                    };
+                    let quitting = command == win::tray::Command::Quit;
+                    cx.update(|cx| match command {
+                        win::tray::Command::Capture => app::trigger_capture(cx),
+                        win::tray::Command::CaptureRegion { x, y, w, h } => {
+                            app::capture_region_and_pin(cx, x, y, w, h)
+                        }
+                        win::tray::Command::RestorePin => app::restore_last_pin(cx),
+                        win::tray::Command::ShowSettings => app::open_settings(cx),
+                        win::tray::Command::HotkeyStatus { capture, restore } => {
+                            app::state_mut(cx).hotkey_status = Some((capture, restore));
+                        }
+                        win::tray::Command::Quit => app::quit(cx),
+                    });
+                    if quitting {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        });
+
+    // Make sure no ghost icon is left behind in the notification area.
+    win::tray::shutdown();
+}
+
+/// Records panics to `%TEMP%\xshot-panic.log`.
+///
+/// Release builds have no console attached, so without this a crash inside the
+/// window procedure would be completely silent.
+fn install_panic_log() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        use std::io::Write as _;
+        let path = std::env::temp_dir().join("xshot-panic.log");
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            let _ = writeln!(file, "--- xshot panic ---");
+            let _ = writeln!(file, "{info}");
+            let _ = writeln!(file, "{}", std::backtrace::Backtrace::force_capture());
+        }
+        previous(info);
+    }));
+}

@@ -1,0 +1,2445 @@
+//! The QQ-style capture overlay.
+//!
+//! This is one GPUI window stretched across the virtual desktop showing the
+//! frozen screen grab, with GPUI elements and paths layered on top: the dimmed
+//! mask, the marching selection, the live annotation preview, the floating
+//! toolbar and the text tool. Nothing here touches pixels directly — the
+//! vector work is GPUI's `canvas`/`Path` API, and the final composite happens
+//! once, on commit.
+
+use std::ops::Range;
+use std::sync::Arc;
+use std::time::Duration;
+
+use gpui_kit::*;
+
+use crate::annot::{BRUSHES, ERASERS, MosaicPreview, PALETTE, Pt, Rect, Shape, Tool, WIDTHS};
+use crate::app;
+use crate::win::frame::Dib;
+use crate::win::util as win_util;
+use crate::win::{clip, paint};
+
+/// What committing the current selection should produce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Finish {
+    Copy,
+    Save,
+    Pin,
+}
+
+/// A toolbar button press.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Action {
+    Arm(Tool),
+    Stroke(u32),
+    Weight(f32),
+    Brush(f32),
+    EraserSize(f32),
+    Block(f32),
+    Undo,
+    Copy,
+    Save,
+    Pin,
+    Cancel,
+}
+
+/// Which edge or corner of the selection is being dragged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Handle {
+    N,
+    S,
+    W,
+    E,
+    NW,
+    NE,
+    SW,
+    SE,
+}
+
+impl Handle {
+    /// The pointer that tells the user which way this handle will pull.
+    fn cursor(self) -> CursorStyle {
+        match self {
+            Handle::N | Handle::S => CursorStyle::ResizeUpDown,
+            Handle::W | Handle::E => CursorStyle::ResizeLeftRight,
+            Handle::NW | Handle::SE => CursorStyle::ResizeUpLeftDownRight,
+            Handle::NE | Handle::SW => CursorStyle::ResizeUpRightDownLeft,
+        }
+    }
+}
+
+/// An interaction currently in flight.
+#[derive(Debug, Clone)]
+enum Drag {
+    /// Rubber-banding a brand new selection.
+    Creating { anchor: Pt },
+    /// Sliding the whole selection.
+    Moving { grab: Pt, original: Rect },
+    /// Resizing from one edge or corner.
+    Resizing { handle: Handle, original: Rect },
+    /// Drawing a shape with one of the tools.
+    Drawing,
+    /// Wiping annotations with the eraser, remembering where it last was.
+    Erasing { last: Pt },
+    /// Sliding an already-drawn annotation, by index into `shapes`.
+    MovingShape { index: usize, last: Pt },
+    /// Resizing a selected annotation from one of its handles.
+    ResizingShape { index: usize, handle: Handle, original: Rect },
+}
+
+/// In-progress text entry, with offsets in UTF-16 units to match GPUI's IME
+/// contract.
+struct TextEdit {
+    origin: Pt,
+    text: String,
+    selection: Range<usize>,
+    marked: Option<Range<usize>>,
+}
+
+/// Rough height of the floating toolbar, used to flip it above the selection
+/// when there is not enough room below.
+const TOOLBAR_HEIGHT: f32 = 38.0;
+/// How close the pointer must be to a handle to grab it.
+const HANDLE_GRAB: f32 = 7.0;
+/// How close the pointer must be to an annotation to grab and move it.
+const GRAB_SLACK: f32 = 4.0;
+/// A drag shorter than this is treated as a click and clears the selection.
+const MIN_SELECTION: f32 = 4.0;
+
+/// Arrow head geometry, as multiples of the stroke width.
+const ARROW_HEAD_LENGTH: f32 = 5.0;
+const ARROW_HEAD_HALF_WIDTH: f32 = 2.1;
+
+/// Side of the loupe's source crop, in screen pixels. Odd, so there is a middle
+/// pixel to sample.
+const MAGNIFIER_CROP: i32 = 21;
+/// How much that crop is blown up.
+const MAGNIFIER_ZOOM: u32 = 5;
+/// Distance from the pointer to the loupe panel.
+const MAGNIFIER_OFFSET: f32 = 22.0;
+/// How often the physical Shift key is polled while a capture is open.
+const SHIFT_POLL: Duration = Duration::from_millis(25);
+/// `VK_SHIFT`.
+const VK_SHIFT: u8 = 0x10;
+/// How long the cached window geometry for the hover highlight is trusted.
+///
+/// Nothing on screen moves while a capture is open, so this only has to be
+/// short enough to notice a window appearing or closing mid-capture.
+const HOVER_INDEX_TTL: Duration = Duration::from_millis(400);
+
+/// The loupe shown before a region has been framed: a magnified crop of the
+/// frozen screen plus the colour of the pixel at its centre.
+struct Magnifier {
+    /// Frame pixel the crop is centred on, so the crop is only rebuilt when the
+    /// pointer crosses into a different pixel.
+    centre: (i32, i32),
+    image: Arc<RenderImage>,
+}
+
+pub struct Overlay {
+    /// The frozen desktop, kept around for the final GDI composite.
+    source: Dib,
+    /// The same pixels, ready for GPUI to draw.
+    image: Arc<RenderImage>,
+    /// Physical size of the captured frame.
+    frame_size: (f32, f32),
+    /// Physical position of the captured frame's top-left corner.
+    screen_origin: (f32, f32),
+    /// Device pixels per logical pixel, i.e. the display's DPI scale. Used
+    /// whenever logical window coordinates have to be expressed as screen
+    /// coordinates (positioning a pin, for instance).
+    scale: f32,
+    /// Device pixels per logical pixel across the *client area*, per axis.
+    ///
+    /// A window's client area is not always the size we asked for, so the
+    /// frozen frame does not map onto it 1:1. Measuring the real ratio keeps
+    /// the crop aligned with what the user sees even when that happens.
+    map: (f32, f32),
+    /// Logical size of the overlay's client area.
+    view_size: (f32, f32),
+    /// The focus handle the root element tracks.
+    focus: FocusHandle,
+
+    selection: Option<Rect>,
+    /// The window under the pointer, highlighted before anything is selected.
+    hover_rect: Option<Rect>,
+    /// The annotation whose resize handles are showing, if any.
+    selected_shape: Option<usize>,
+    drag: Option<Drag>,
+    tool: Option<Tool>,
+    color: u32,
+    width: f32,
+    /// Mosaic brush width and block size.
+    brush: f32,
+    block: f32,
+    /// Eraser width.
+    eraser: f32,
+    /// Opacity of the mask drawn outside the selection.
+    dim: f32,
+    /// The pointer currently shown, so it can follow what is under the mouse.
+    cursor: Option<CursorStyle>,
+    /// Where the pointer is, in logical overlay coordinates.
+    ///
+    /// Drives both the round brush cursor the painting tools show and the loupe
+    /// that is up before a region has been framed.
+    pointer: Option<Pt>,
+    /// Cached window geometry for the hover highlight, plus when it was taken.
+    hover_index: win_util::HoverIndex,
+    hover_index_at: Option<std::time::Instant>,
+    /// The loupe image, kept until the pointer moves to another pixel.
+    magnifier: Option<Magnifier>,
+    /// Whether the sampled colour is shown as `#RRGGBB` or `rgb(r, g, b)`.
+    colour_hex: bool,
+    /// When the sampled colour was last copied, for the little confirmation.
+    colour_copied: Option<std::time::Instant>,
+    /// Whether the Shift watcher has been started for this window.
+    shift_watcher: bool,
+    /// Last time a live mosaic preview was rebuilt, to keep dragging cheap.
+    last_mosaic_at: Option<std::time::Instant>,
+    shapes: Vec<Shape>,
+    draft: Option<Shape>,
+    text: Option<TextEdit>,
+}
+
+impl Overlay {
+    pub fn new(
+        source: Dib,
+        screen_origin: (i32, i32),
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let scale = window.scale_factor();
+        let frame_size = (source.width as f32, source.height as f32);
+        let image = source.to_render_image();
+        // The overlay covers the whole desktop, so the pointer is already on it.
+        // Starting from the real cursor position means the loupe and the colour
+        // readout are live from the first frame instead of waiting for the user
+        // to jiggle the mouse — which matters if C is the first thing they press.
+        let (cursor_x, cursor_y) = win_util::cursor_position();
+        let pointer = Pt::new(
+            (cursor_x - screen_origin.0) as f32 / scale,
+            (cursor_y - screen_origin.1) as f32 / scale,
+        );
+        Self {
+            source,
+            image,
+            frame_size,
+            screen_origin: (screen_origin.0 as f32, screen_origin.1 as f32),
+            scale,
+            map: (scale, scale),
+            view_size: (frame_size.0 / scale, frame_size.1 / scale),
+            focus: cx.focus_handle(),
+            selection: None,
+            hover_rect: None,
+            selected_shape: None,
+            drag: None,
+            tool: None,
+            color: PALETTE[0],
+            width: WIDTHS[1],
+            brush: BRUSHES[1],
+            block: app::state(cx).config.mosaic_block.clamp(4.0, 48.0),
+            eraser: ERASERS[1],
+            dim: app::state(cx).config.dim_strength.clamp(0.0, 0.9),
+            cursor: Some(CursorStyle::Crosshair),
+            pointer: Some(pointer),
+            hover_index: win_util::HoverIndex::default(),
+            hover_index_at: None,
+            magnifier: None,
+            colour_hex: true,
+            colour_copied: None,
+            shift_watcher: false,
+            last_mosaic_at: None,
+            shapes: Vec::new(),
+            draft: None,
+            text: None,
+        }
+    }
+
+    pub fn focus_handle(&self) -> FocusHandle {
+        self.focus.clone()
+    }
+
+    // -- geometry helpers -------------------------------------------------
+
+    fn view_size(&self) -> (f32, f32) {
+        self.view_size
+    }
+
+    fn local(&self, position: Point<Pixels>) -> Pt {
+        // GPUI already reports mouse positions in logical pixels, which is the
+        // space annotations live in.
+        Pt::new(position.x.as_f32(), position.y.as_f32())
+    }
+
+    /// A shape's stored coordinates converted to physical pixels for the
+    /// compositor.
+    fn composite_offset(&self, origin_device: (i32, i32)) -> (f32, f32) {
+        (-(origin_device.0 as f32), -(origin_device.1 as f32))
+    }
+
+    /// Everything that should be previewed, including the in-progress draft.
+    fn preview_shapes(&self) -> Vec<Shape> {
+        let mut shapes = self.shapes.clone();
+        if let Some(draft) = &self.draft {
+            shapes.push(draft.clone());
+        }
+        shapes
+    }
+
+    // -- text handling ----------------------------------------------------
+
+    fn begin_text(&mut self, origin: Pt) {
+        self.text = Some(TextEdit {
+            origin,
+            text: String::new(),
+            selection: 0..0,
+            marked: None,
+        });
+    }
+
+    /// Turns the in-progress text into a committed annotation.
+    fn commit_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(edit) = self.text.take() else {
+            return;
+        };
+        let _ = window;
+        if edit.text.trim().is_empty() {
+            return;
+        }
+        self.shapes.push(Shape::Text {
+            pos: edit.origin,
+            text: edit.text,
+            color: self.color,
+            size: 20.0,
+        });
+        cx.notify();
+    }
+
+    fn backspace(&mut self) {
+        let Some(edit) = self.text.as_mut() else {
+            return;
+        };
+        let (start, end) = if !edit.selection.is_empty() {
+            (
+                utf8_index_for_utf16(&edit.text, edit.selection.start),
+                utf8_index_for_utf16(&edit.text, edit.selection.end),
+            )
+        } else if let Some(marked) = edit.marked.clone() {
+            (
+                utf8_index_for_utf16(&edit.text, marked.start),
+                utf8_index_for_utf16(&edit.text, marked.end),
+            )
+        } else {
+            let caret = utf8_index_for_utf16(&edit.text, edit.selection.start);
+            let previous = edit.text[..caret]
+                .char_indices()
+                .next_back()
+                .map(|(index, _)| index)
+                .unwrap_or(0);
+            (previous, caret)
+        };
+        edit.text.replace_range(start..end, "");
+        let caret = utf16_index_for_utf8(&edit.text, start);
+        edit.selection = caret..caret;
+        edit.marked = None;
+    }
+
+    /// Replaces `target` (or the mark, or the selection) with `new_text`.
+    fn splice(&mut self, range: Option<Range<usize>>, new_text: &str, mark: bool, new_selection: Option<Range<usize>>) {
+        let Some(edit) = self.text.as_mut() else {
+            return;
+        };
+        let target = range
+            .or_else(|| edit.marked.clone())
+            .unwrap_or_else(|| edit.selection.clone());
+        let start = utf8_index_for_utf16(&edit.text, target.start);
+        let end = utf8_index_for_utf16(&edit.text, target.end);
+        edit.text.replace_range(start..end, new_text);
+
+        let inserted_start = utf16_index_for_utf8(&edit.text, start);
+        let inserted_end = inserted_start + utf16_len(new_text);
+
+        if mark {
+            edit.marked = Some(inserted_start..inserted_end);
+            edit.selection = match new_selection {
+                Some(range) => (inserted_start + range.start)..(inserted_start + range.end),
+                None => inserted_end..inserted_end,
+            };
+        } else {
+            edit.marked = None;
+            edit.selection = inserted_end..inserted_end;
+        }
+    }
+
+    // -- committing -------------------------------------------------------
+
+    fn finish(&mut self, mode: Finish, window: &mut Window, cx: &mut Context<Self>) {
+        crate::trace_log!(
+            "xshot: finish {mode:?} selection={:?} shapes={}",
+            self.selection.map(|s| (s.x, s.y, s.w, s.h)),
+            self.shapes.len()
+        );
+        self.commit_text(window, cx);
+
+        let Some(selection) = self.selection else {
+            // Nothing was selected: treat the gesture as "dismiss".
+            app::state_mut(cx).overlay = None;
+            window.remove_window();
+            return;
+        };
+
+        let map = self.map;
+        let origin_x = (selection.x * map.0).round().clamp(0.0, self.frame_size.0 - 1.0) as i32;
+        let origin_y = (selection.y * map.1).round().clamp(0.0, self.frame_size.1 - 1.0) as i32;
+        let width = ((selection.w * map.0).round() as i32).clamp(1, self.source.width - origin_x);
+        let height = ((selection.h * map.1).round() as i32).clamp(1, self.source.height - origin_y);
+
+        let Ok(mut output) = self.source.crop(origin_x, origin_y, width, height) else {
+            app::state_mut(cx).overlay = None;
+            window.remove_window();
+            return;
+        };
+        let offset = self.composite_offset((origin_x, origin_y));
+        paint::draw_shapes(&mut output, &self.shapes, map, offset);
+
+        match mode {
+            Finish::Copy => {
+                if let Err(error) = clip::copy_image(&output) {
+                    eprintln!("xshot: clipboard write failed: {error:#}");
+                }
+            }
+            Finish::Save => {
+                let directory = app::state(cx).config.save_dir.clone();
+                let name = format!("xshot_{}.png", chrono::Local::now().format("%Y%m%d_%H%M%S"));
+                if let Err(error) = output.save_png(&directory.join(name)) {
+                    eprintln!("xshot: save failed: {error:#}");
+                }
+            }
+            Finish::Pin => {
+                // The pin should land exactly where the selection sat on screen.
+                let position = (
+                    (self.screen_origin.0 + origin_x as f32) / self.scale,
+                    (self.screen_origin.1 + origin_y as f32) / self.scale,
+                );
+                app::open_pin(cx, output, position, self.scale);
+            }
+        }
+
+        app::state_mut(cx).overlay = None;
+        window.remove_window();
+    }
+
+    fn cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        app::state_mut(cx).overlay = None;
+        window.remove_window();
+    }
+
+    fn apply(&mut self, action: Action, window: &mut Window, cx: &mut Context<Self>) {
+        match action {
+            // Clicking the armed tool again disarms it, returning to selection
+            // editing.
+            Action::Arm(tool) => self.arm(tool, window, cx),
+            Action::Stroke(color) => self.color = color,
+            Action::Weight(width) => self.width = width,
+            Action::Brush(brush) => self.brush = brush,
+            Action::EraserSize(size) => self.eraser = size,
+            Action::Block(block) => self.block = block,
+            Action::Undo => {
+                self.shapes.pop();
+            }
+            Action::Copy => self.finish(Finish::Copy, window, cx),
+            Action::Save => self.finish(Finish::Save, window, cx),
+            Action::Pin => self.finish(Finish::Pin, window, cx),
+            Action::Cancel => self.cancel(window, cx),
+        }
+        cx.notify();
+    }
+
+    // -- input ------------------------------------------------------------
+
+    fn on_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let position = self.local(event.position);
+        let (view_w, view_h) = self.view_size();
+        // A press without a preceding move still has to place the loupe and the
+        // brush cursor, or the very first click of a session would show neither.
+        self.pointer = Some(position);
+        self.refresh_magnifier();
+
+        if event.button == MouseButton::Right {
+            // Right click backs out one level: first the tool, then the overlay.
+            if self.text.is_some() {
+                self.text = None;
+            } else if self.tool.is_some() {
+                self.tool = None;
+            } else {
+                self.cancel(window, cx);
+                return;
+            }
+            cx.notify();
+            return;
+        }
+
+        if event.button != MouseButton::Left {
+            return;
+        }
+
+        // Double-clicking inside the selection finishes the shot, exactly as it
+        // does in QQ's tool. It is also the only finish gesture that is
+        // instantaneous: GPUI holds the Enter key back briefly to see whether
+        // it starts a multi-key binding, but mouse events are never delayed.
+        //
+        // The text tool is included because a label is never entered by
+        // double-clicking, and leaving it armed after typing is the common
+        // case.
+        if event.click_count >= 2 && matches!(self.tool, None | Some(Tool::Text)) {
+            if let Some(selection) = self.selection {
+                if selection.contains(position) {
+                    let mode = default_finish(cx);
+                    self.finish(mode, window, cx);
+                    return;
+                }
+            }
+        }
+
+        if self.text.is_some() {
+            self.commit_text(window, cx);
+        }
+
+        // Handles are checked before the armed tool, so a selection can still
+        // be resized after drawing something — the tool stays armed by design,
+        // and otherwise every press near an edge would just draw another shape.
+        // A selected annotation's own handles come first: they sit on top.
+        if let Some((index, handle)) = self.shape_handles_at(position) {
+            let original = self.shapes[index].bounds();
+            self.drag = Some(Drag::ResizingShape { index, handle, original });
+            cx.notify();
+            return;
+        }
+        if let Some(selection) = self.selection {
+            if let Some(handle) = hit_handle(position, &selection) {
+                self.drag = Some(Drag::Resizing { handle, original: selection });
+                cx.notify();
+                return;
+            }
+        }
+
+        // Picking up existing ink also beats drawing, for the same reason.
+        if let Some(index) = self.shape_ink_at(position) {
+            self.selected_shape = Some(index);
+            self.drag = Some(Drag::MovingShape { index, last: position });
+            win_util::show_move_cursor();
+            cx.notify();
+            return;
+        }
+
+        if let Some(tool) = self.tool {
+            match tool {
+                Tool::Text => self.begin_text(position),
+                Tool::Eraser => {
+                    // The eraser has no shape of its own: it removes whatever
+                    // it is dragged across.
+                    self.erase_at(position, position);
+                    self.drag = Some(Drag::Erasing { last: position });
+                }
+                Tool::Rect => {
+                    self.draft = Some(Shape::Rect {
+                        a: position,
+                        b: position,
+                        color: self.color,
+                        width: self.width,
+                    });
+                    self.drag = Some(Drag::Drawing);
+                }
+                Tool::Ellipse => {
+                    self.draft = Some(Shape::Ellipse {
+                        a: position,
+                        b: position,
+                        color: self.color,
+                        width: self.width,
+                    });
+                    self.drag = Some(Drag::Drawing);
+                }
+                Tool::Arrow => {
+                    self.draft = Some(Shape::Arrow {
+                        a: position,
+                        b: position,
+                        color: self.color,
+                        width: self.width,
+                    });
+                    self.drag = Some(Drag::Drawing);
+                }
+                Tool::Pen => {
+                    self.draft = Some(Shape::Pen {
+                        points: vec![position],
+                        color: self.color,
+                        width: self.width,
+                    });
+                    self.drag = Some(Drag::Drawing);
+                }
+                Tool::Mosaic => {
+                    self.last_mosaic_at = None;
+                    self.draft = Some(Shape::Mosaic {
+                        points: vec![position],
+                        brush: self.brush,
+                        block: self.block,
+                        preview: None,
+                    });
+                    self.drag = Some(Drag::Drawing);
+                }
+            }
+            cx.notify();
+            return;
+        }
+
+        if let Some(selection) = self.selection {
+            // An annotation under the pointer is grabbed before the selection
+            // itself: shapes are drawn inside the selection, so this is what
+            // makes "pick the rectangle up and move it" work.
+            if let Some(index) = self.shape_box_at(position) {
+                self.selected_shape = Some(index);
+                self.drag = Some(Drag::MovingShape { index, last: position });
+                win_util::show_move_cursor();
+                cx.notify();
+                return;
+            }
+            if selection.contains(position) {
+                self.selected_shape = None;
+                self.drag = Some(Drag::Moving { grab: position, original: selection });
+                cx.notify();
+                return;
+            }
+        }
+
+        // A press on empty space accepts the window the pointer was lighting
+        // up; dragging from there replaces it with a hand-drawn region.
+        self.selected_shape = None;
+        self.selection = self
+            .hover_rect
+            .or(Some(Rect::new(position.x, position.y, 0.0, 0.0)));
+        self.drag = Some(Drag::Creating { anchor: position });
+        let _ = (view_w, view_h);
+        cx.notify();
+    }
+
+    fn on_mouse_move(&mut self, event: &MouseMoveEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        let position = self.local(event.position);
+        let (view_w, view_h) = self.view_size();
+
+        // The loupe and the round brush cursor follow every move, whether the
+        // user is painting, framing or just looking around.
+        self.pointer = Some(position);
+        self.refresh_magnifier();
+
+        let Some(drag) = self.drag.clone() else {
+            // Idle: keep the pointer honest about what is under it — a resize
+            // arrow over a handle, a move pointer over something draggable —
+            // and light up the window the user is pointing at.
+            self.detect_hover(cx);
+            self.update_cursor(position, cx);
+            cx.notify();
+            return;
+        };
+
+        match drag {
+            Drag::Creating { anchor } => {
+                self.selection = Some(Rect::from_corners(anchor, position).clamp(view_w, view_h));
+            }
+            Drag::Moving { grab, original } => {
+                let dx = position.x - grab.x;
+                let dy = position.y - grab.y;
+                let moved = Rect::new(original.x + dx, original.y + dy, original.w, original.h);
+                // Clamp by shifting instead of cropping so the size is kept.
+                let x = moved.x.clamp(0.0, (view_w - original.w).max(0.0));
+                let y = moved.y.clamp(0.0, (view_h - original.h).max(0.0));
+                self.selection = Some(Rect::new(x, y, original.w, original.h));
+            }
+            Drag::Resizing { handle, original } => {
+                self.selection = Some(resize(original, handle, position, view_w, view_h));
+            }
+            Drag::Drawing => match self.draft.as_mut() {
+                Some(Shape::Rect { b, .. })
+                | Some(Shape::Ellipse { b, .. })
+                | Some(Shape::Arrow { b, .. }) => *b = position,
+                Some(Shape::Pen { points, .. }) | Some(Shape::Mosaic { points, .. }) => {
+                    if points
+                        .last()
+                        .map(|last| (last.x - position.x).abs() + (last.y - position.y).abs() > 1.5)
+                        .unwrap_or(true)
+                    {
+                        points.push(position);
+                    }
+                }
+                _ => {}
+            },
+            Drag::Erasing { last } => {
+                self.erase_at(last, position);
+                self.drag = Some(Drag::Erasing { last: position });
+            }
+            Drag::MovingShape { index, last } => {
+                let (dx, dy) = (position.x - last.x, position.y - last.y);
+                if let Some(shape) = self.shapes.get_mut(index) {
+                    shape.translate(dx, dy);
+                }
+                self.drag = Some(Drag::MovingShape { index, last: position });
+            }
+            Drag::ResizingShape { index, handle, original } => {
+                let next = resize(original, handle, position, view_w, view_h);
+                if let Some(shape) = self.shapes.get_mut(index) {
+                    if let Shape::Rect { a, b, .. } | Shape::Ellipse { a, b, .. } = shape {
+                        *a = Pt::new(next.x, next.y);
+                        *b = Pt::new(next.right(), next.bottom());
+                    }
+                }
+                self.drag = Some(Drag::ResizingShape { index, handle, original });
+            }
+        }
+
+        // Keep the pointer consistent with what the drag is doing: a closed
+        // hand while carrying an annotation, the resize arrow while pulling a
+        // handle.
+        // Keep the pointer consistent with what the drag is doing: the move
+        // pointer while carrying an annotation, the resize arrow while pulling
+        // a handle.
+        match &self.drag {
+            Some(Drag::MovingShape { .. }) => {
+                if self.cursor != Some(CursorStyle::Arrow) {
+                    self.cursor = Some(CursorStyle::Arrow);
+                    cx.notify();
+                }
+                win_util::show_move_cursor();
+            }
+            Some(Drag::ResizingShape { handle, .. }) => {
+                let want = Some(handle.cursor());
+                if self.cursor != want {
+                    self.cursor = want;
+                    cx.notify();
+                }
+            }
+            Some(Drag::Resizing { handle, .. }) => {
+                let want = Some(handle.cursor());
+                if self.cursor != want {
+                    self.cursor = want;
+                    cx.notify();
+                }
+            }
+            _ => {}
+        }
+
+        // Rebuilding the mosaic bitmap is the one expensive part of a freehand
+        // mosaic, so it is rate-limited rather than done on every mouse sample.
+        if matches!(self.draft, Some(Shape::Mosaic { .. })) {
+            let due = self
+                .last_mosaic_at
+                .map(|at| at.elapsed().as_millis() >= 55)
+                .unwrap_or(true);
+            if due {
+                self.refresh_mosaic_preview();
+                self.last_mosaic_at = Some(std::time::Instant::now());
+            }
+        }
+        cx.notify();
+    }
+
+    fn on_mouse_up(&mut self, event: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        let position = self.local(event.position);
+        let Some(drag) = self.drag.take() else {
+            return;
+        };
+        self.update_cursor(position, cx);
+
+        match drag {
+            Drag::Creating { .. } => {
+                if let Some(selection) = self.selection {
+                    if selection.w < MIN_SELECTION || selection.h < MIN_SELECTION {
+                        self.selection = None;
+                    }
+                }
+            }
+            Drag::Drawing => {
+                if let Some(draft) = self.draft.take() {
+                    let keep = match &draft {
+                        Shape::Rect { a, b, .. } | Shape::Ellipse { a, b, .. } => {
+                            (a.x - b.x).abs() >= 2.0 && (a.y - b.y).abs() >= 2.0
+                        }
+                        Shape::Arrow { a, b, .. } => {
+                            (a.x - b.x).abs() >= 2.0 || (a.y - b.y).abs() >= 2.0
+                        }
+                        Shape::Pen { points, .. } | Shape::Mosaic { points, .. } => {
+                            !points.is_empty()
+                        }
+                        Shape::Text { .. } => true,
+                    };
+                    if keep {
+                        self.shapes.push(draft);
+                    }
+                }
+            }
+            _ => {}
+        }
+        cx.notify();
+    }
+
+    /// Highlights the window under the pointer until a selection is started.
+    ///
+    /// This is the "point at a window and it lights up" behaviour every
+    /// screenshot tool has: the user does not have to trace a window's edges by
+    /// hand, and clicking takes the whole window.
+    fn detect_hover(&mut self, cx: &mut Context<Self>) {
+        if self.selection.is_some() || self.tool.is_some() {
+            if self.hover_rect.take().is_some() {
+                cx.notify();
+            }
+            return;
+        }
+        // The window list is collected at most a couple of times a second and
+        // hit-tested in memory. Enumerating every top-level window — and asking
+        // DWM for each one's real bounds — on every mouse sample is what made
+        // the pointer crawl when it was over the desktop: with no window under
+        // it the walk never short-circuits, so each sample paid for the whole
+        // window list.
+        let due = self
+            .hover_index_at
+            .map(|at| at.elapsed() >= HOVER_INDEX_TTL)
+            .unwrap_or(true);
+        if due {
+            self.hover_index = win_util::HoverIndex::build();
+            self.hover_index_at = Some(std::time::Instant::now());
+        }
+
+        let next = self
+            .pointer
+            .map(|pointer| self.screen_position(pointer))
+            .and_then(|(x, y)| self.hover_index.hit(x, y))
+            .and_then(|(x, y, w, h)| {
+                let (origin_x, origin_y) = self.screen_origin;
+                let (map_x, map_y) = self.map;
+                let rect = Rect::new(
+                (x as f32 - origin_x) / map_x,
+                (y as f32 - origin_y) / map_y,
+                w as f32 / map_x,
+                h as f32 / map_y,
+            );
+            (rect.w > 8.0 && rect.h > 8.0).then_some(rect)
+        });
+        if next != self.hover_rect {
+            self.hover_rect = next;
+            cx.notify();
+        }
+    }
+
+    /// The eight handles of the currently selected annotation, if it has any.
+    fn shape_handles_at(&self, position: Pt) -> Option<(usize, Handle)> {
+        let index = self.selected_shape?;
+        let shape = self.shapes.get(index)?;
+        if !matches!(shape, Shape::Rect { .. } | Shape::Ellipse { .. }) {
+            return None;
+        }
+        hit_handle(position, &shape.bounds()).map(|handle| (index, handle))
+    }
+
+    /// The topmost annotation whose *ink* is under `point`.
+    ///
+    /// Grabbing by the drawn line itself is checked before any armed tool, so a
+    /// shape can be picked up straight after drawing it — the tool stays armed
+    /// on purpose, and otherwise the press would just start another shape.
+    fn shape_ink_at(&self, point: Pt) -> Option<usize> {
+        self.shapes
+            .iter()
+            .rposition(|shape| shape.touched_by(point, point, GRAB_SLACK))
+    }
+
+    /// The topmost annotation whose box contains `point`.
+    ///
+    /// Only consulted when no tool is armed: it lets a hollow rectangle be
+    /// picked up from its empty middle as well as from its outline.
+    fn shape_box_at(&self, point: Pt) -> Option<usize> {
+        self.shapes
+            .iter()
+            .rposition(|shape| shape.grabbed_by(point, GRAB_SLACK))
+    }
+
+    /// What the pointer should look like at `position`.
+    ///
+    /// Returns `None` when the pointer should be the four-way move cursor,
+    /// which the toolkit cannot express and is set through Win32 instead.
+    fn cursor_for(&self, position: Pt) -> Option<CursorStyle> {
+        if let Some((_, handle)) = self.shape_handles_at(position) {
+            return Some(handle.cursor());
+        }
+        if let Some(selection) = self.selection {
+            if let Some(handle) = hit_handle(position, &selection) {
+                return Some(handle.cursor());
+            }
+        }
+        if self.shape_ink_at(position).is_some()
+            || (self.tool.is_none() && self.shape_box_at(position).is_some())
+        {
+            return None;
+        }
+        Some(CursorStyle::Crosshair)
+    }
+
+    /// Applies [`Self::cursor_for`], falling back to the Win32 move pointer.
+    fn update_cursor(&mut self, position: Pt, cx: &mut Context<Self>) {
+        match self.cursor_for(position) {
+            Some(style) => {
+                if self.cursor != Some(style) {
+                    self.cursor = Some(style);
+                    cx.notify();
+                }
+            }
+            None => {
+                // Declare the arrow so the toolkit stops fighting us, then ask
+                // Windows for the move pointer.
+                if self.cursor != Some(CursorStyle::Arrow) {
+                    self.cursor = Some(CursorStyle::Arrow);
+                    cx.notify();
+                }
+                win_util::show_move_cursor();
+            }
+        }
+    }
+
+    /// Rubs out whatever the eraser stroke was dragged across.
+    ///
+    /// Nothing is deleted wholesale: a shape that has an outline is reduced to
+    /// the parts of that outline the rubber did not touch, so erasing the middle
+    /// of a rectangle leaves its other three sides, and erasing across a pencil
+    /// squiggle leaves both ends. Only a shape the rubber never reaches is kept
+    /// exactly as it was, which also means it keeps its resize handles.
+    fn erase_at(&mut self, from: Pt, to: Pt) {
+        let radius = self.eraser / 2.0;
+        // Indices are about to change, so the selection cannot survive.
+        self.selected_shape = None;
+        let mut kept: Vec<Shape> = Vec::with_capacity(self.shapes.len());
+        for shape in std::mem::take(&mut self.shapes) {
+            // Every shape with an outline — including rectangles, ellipses and
+            // arrows, which are outlines just as much as a pencil line is — is
+            // cut where the rubber crossed it and survives as pencil pieces.
+            if let Some(outline) = crate::annot::outline_of(&shape) {
+                let (color, width) = shape.ink();
+                if !crate::annot::polyline_touched(&outline, from, to, radius) {
+                    kept.push(shape);
+                    continue;
+                }
+                for run in crate::annot::split_pen(&outline, from, to, radius) {
+                    kept.push(Shape::Pen { points: run, color, width });
+                }
+                continue;
+            }
+            match shape {
+                Shape::Pen { points, color, width } => {
+                    for run in crate::annot::split_pen(&points, from, to, radius) {
+                        kept.push(Shape::Pen { points: run, color, width });
+                    }
+                }
+                Shape::Mosaic { points, brush, block, .. } => {
+                    // The mosaic is carved out of the captured pixels, so
+                    // dropping the covered samples restores the original image
+                    // exactly where the rubber passed.
+                    let reach = radius + brush / 2.0;
+                    for run in crate::annot::split_pen(&points, from, to, reach) {
+                        let preview = self.build_mosaic_preview(&run, brush, block);
+                        kept.push(Shape::Mosaic { points: run, brush, block, preview });
+                    }
+                }
+                // Text has no outline to cut, so it goes when the rubber
+                // reaches it; a letter-by-letter erase is not worth pretending.
+                text @ Shape::Text { .. } => {
+                    if !text.touched_by(from, to, radius) {
+                        kept.push(text);
+                    }
+                }
+                // `outline_of` covered the rest.
+                other => kept.push(other),
+            }
+        }
+        self.shapes = kept;
+    }
+
+    /// Rebuilds the live mosaic bitmap for the stroke being painted.
+    fn refresh_mosaic_preview(&mut self) {
+        let Some(Shape::Mosaic { points, brush, block, .. }) = &self.draft else {
+            return;
+        };
+        let (points, brush, block) = (points.clone(), *brush, *block);
+        let preview = self.build_mosaic_preview(&points, brush, block);
+        if let Some(Shape::Mosaic { preview: slot, .. }) = self.draft.as_mut() {
+            *slot = preview;
+        }
+    }
+
+    /// Renders the blocky bitmap shown while a mosaic stroke is being painted.
+    ///
+    /// It is produced from the same pixels, brush and block size the final
+    /// composite will use, so what the user sees is what gets saved.
+    fn build_mosaic_preview(
+        &self,
+        points: &[Pt],
+        brush: f32,
+        block: f32,
+    ) -> Option<MosaicPreview> {
+        if points.is_empty() {
+            return None;
+        }
+        let (map_x, map_y) = self.map;
+        let half = brush / 2.0;
+        let logical = crate::annot::bounds_of(points).inflate(half);
+        let x0 = (logical.x * map_x).floor().max(0.0) as i32;
+        let y0 = (logical.y * map_y).floor().max(0.0) as i32;
+        let x1 = (logical.right() * map_x).ceil().min(self.frame_size.0) as i32;
+        let y1 = (logical.bottom() * map_y).ceil().min(self.frame_size.1) as i32;
+        let (width, height) = (x1 - x0, y1 - y0);
+        if width < 2 || height < 2 {
+            return None;
+        }
+
+        let mut tile = self.source.crop(x0, y0, width, height).ok()?;
+        // The stroke stays in screen pixels and the tile declares where its own
+        // origin sits in that space, so the block grid here is the same grid the
+        // exported image uses no matter where the tile happens to be cropped.
+        let frame: Vec<(f32, f32)> = points
+            .iter()
+            .map(|p| (p.x * map_x, p.y * map_y))
+            .collect();
+        paint::pixelate_stroke(
+            &mut tile,
+            &frame,
+            (brush * map_x).round().max(2.0) as i32,
+            (block * map_x).round().max(2.0) as i32,
+            (x0, y0),
+        );
+
+        Some(MosaicPreview {
+            rect: Rect::new(
+                x0 as f32 / map_x,
+                y0 as f32 / map_y,
+                width as f32 / map_x,
+                height as f32 / map_y,
+            ),
+            image: tile.to_render_image(),
+        })
+    }
+
+    // -- colour sampling ---------------------------------------------------
+
+    /// The frozen frame's pixel under a logical overlay position.
+    fn frame_pixel(&self, position: Pt) -> (i32, i32) {
+        let x = (position.x * self.map.0).round() as i32;
+        let y = (position.y * self.map.1).round() as i32;
+        (
+            x.clamp(0, (self.source.width - 1).max(0)),
+            y.clamp(0, (self.source.height - 1).max(0)),
+        )
+    }
+
+    /// The screen colour under a logical overlay position, as `RGB`.
+    fn pixel_colour(&self, position: Pt) -> [u8; 3] {
+        let (x, y) = self.frame_pixel(position);
+        let pixels = self.source.pixels();
+        // The DIB is BGRA.
+        let index = (y as usize * self.source.width as usize + x as usize) * 4;
+        [pixels[index + 2], pixels[index + 1], pixels[index]]
+    }
+
+    /// The sampled colour written the way the user currently wants to read it.
+    fn colour_text(&self, colour: [u8; 3]) -> String {
+        if self.colour_hex {
+            format!("#{:02X}{:02X}{:02X}", colour[0], colour[1], colour[2])
+        } else {
+            format!("rgb({}, {}, {})", colour[0], colour[1], colour[2])
+        }
+    }
+
+    /// The colours as they appear on *screen*, not in the overlay's logical
+    /// space: the readout is only useful if it matches what other programs call
+    /// the pixel.
+    fn screen_position(&self, position: Pt) -> (i32, i32) {
+        let (x, y) = self.frame_pixel(position);
+        (self.screen_origin.0 as i32 + x, self.screen_origin.1 as i32 + y)
+    }
+
+    /// Rebuilds the loupe when the pointer has crossed into another pixel.
+    ///
+    /// The crop is magnified by hand rather than by scaling the element, so the
+    /// pixels stay square and crisp, which is the whole point of a loupe when
+    /// you are hunting for an exact edge or colour.
+    fn refresh_magnifier(&mut self) {
+        if self.selection.is_some() {
+            self.magnifier = None;
+            return;
+        }
+        let Some(position) = self.pointer else {
+            return;
+        };
+        let centre = self.frame_pixel(position);
+        if self
+            .magnifier
+            .as_ref()
+            .map(|magnifier| magnifier.centre == centre)
+            .unwrap_or(false)
+        {
+            return;
+        }
+        self.magnifier = self.build_magnifier(centre).map(|image| Magnifier { centre, image });
+    }
+
+    fn build_magnifier(&self, centre: (i32, i32)) -> Option<Arc<RenderImage>> {
+        let (frame_w, frame_h) = (self.source.width, self.source.height);
+        if frame_w < 2 || frame_h < 2 {
+            return None;
+        }
+        let crop_w = MAGNIFIER_CROP.min(frame_w);
+        let crop_h = MAGNIFIER_CROP.min(frame_h);
+        let half = MAGNIFIER_CROP / 2;
+        let x0 = (centre.0 - half).clamp(0, frame_w - crop_w);
+        let y0 = (centre.1 - half).clamp(0, frame_h - crop_h);
+        // Where the sampled pixel sits inside the crop, so the crosshair stays
+        // on it even when the crop had to be pushed in from an edge.
+        let focus = ((centre.0 - x0) as u32, (centre.1 - y0) as u32);
+
+        let (zoom, out_w, out_h) = (
+            MAGNIFIER_ZOOM,
+            crop_w as u32 * MAGNIFIER_ZOOM as u32,
+            crop_h as u32 * MAGNIFIER_ZOOM as u32,
+        );
+        let mut buffer = image::RgbaImage::new(out_w, out_h);
+        let source = self.source.pixels();
+        let stride = frame_w as usize * 4;
+        for row in 0..crop_h as u32 {
+            let source_row = (y0 as u32 + row) as usize * stride;
+            for column in 0..crop_w as u32 {
+                let index = source_row + (x0 as u32 + column) as usize * 4;
+                let pixel = image::Rgba([
+                    source[index],
+                    source[index + 1],
+                    source[index + 2],
+                    0xFF,
+                ]);
+                for dy in 0..zoom {
+                    for dx in 0..zoom {
+                        buffer.put_pixel(
+                            column * zoom as u32 + dx,
+                            row * zoom as u32 + dy,
+                            pixel,
+                        );
+                    }
+                }
+            }
+        }
+
+        // A crosshair that stops short of the sample, so the pixel being read
+        // stays visible under it. Drawn twice — black then white — so it reads
+        // on any background.
+        let block = zoom as u32;
+        let arm = block * 3;
+        let (fx, fy) = (focus.0 as i32 * block as i32, focus.1 as i32 * block as i32);
+        for (thickness, ink) in [
+            (2i32, image::Rgba([0u8, 0, 0, 0xFF])),
+            (1i32, image::Rgba([0xFF, 0xFF, 0xFF, 0xFF])),
+        ] {
+            let mut plot = |x: i32, y: i32| {
+                if x >= 0 && y >= 0 && (x as u32) < out_w && (y as u32) < out_h {
+                    buffer.put_pixel(x as u32, y as u32, ink);
+                }
+            };
+            for step in 0..arm as i32 {
+                for offset in 0..thickness {
+                    let gap = block as i32;
+                    // Horizontal arms, then vertical ones, rotated around the
+                    // sample block.
+                    plot(fx + gap + step, fy + offset);
+                    plot(fx - gap - 1 - step, fy + offset);
+                    plot(fx + offset, fy + gap + step);
+                    plot(fx + offset, fy - gap - 1 - step);
+                }
+            }
+        }
+        Some(Arc::new(RenderImage::new(vec![image::Frame::new(buffer)])))
+    }
+
+    /// Watches the physical Shift key for as long as the overlay lives.
+    ///
+    /// The loupe's colour notation swaps on Shift, but GPUI reports *nothing*
+    /// for a bare modifier press — verified against this exact backend, a lone
+    /// Shift produces no key event at all — so the keyboard has to be asked
+    /// directly. One `GetAsyncKeyState` call every 45 ms, and the work stops the
+    /// moment the window goes away.
+    fn watch_shift(cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let mut held = win_util::key_down(VK_SHIFT);
+            loop {
+                cx.background_executor().timer(SHIFT_POLL).await;
+                let down = win_util::key_down(VK_SHIFT);
+                let pressed = down && !held;
+                held = down;
+                let alive = this.update(cx, |overlay, cx| {
+                    // The notation only matters while the loupe is up.
+                    if pressed && overlay.selection.is_none() {
+                        overlay.colour_hex = !overlay.colour_hex;
+                        cx.notify();
+                    }
+                });
+                if alive.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let key = event.keystroke.key.as_str();
+
+        // While the loupe is up: Shift swaps the colour notation and C puts the
+        // sampled colour on the clipboard.
+        if self.selection.is_none() && self.text.is_none() {
+            if key.eq_ignore_ascii_case("c") && !event.keystroke.modifiers.control {
+                if let Some(position) = self.pointer {
+                    let text = self.colour_text(self.pixel_colour(position));
+                    cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(text));
+                    self.colour_copied = Some(std::time::Instant::now());
+                }
+                // Picking a colour is the whole errand: drop straight out of the
+                // capture instead of making the user press Escape as well.
+                self.cancel(window, cx);
+                return;
+            }
+        }
+
+        if self.text.is_some() {
+            match key {
+                "escape" => {
+                    self.text = None;
+                    cx.notify();
+                }
+                "enter" => {
+                    self.commit_text(window, cx);
+                    cx.notify();
+                }
+                "backspace" => {
+                    self.backspace();
+                    cx.notify();
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // Modifier combinations first, so that `Ctrl+P` is not also read as the
+        // plain `p` pencil shortcut.
+        if event.keystroke.modifiers.control {
+            match key {
+                "z" => {
+                    self.shapes.pop();
+                    self.selected_shape = None;
+                    cx.notify();
+                }
+                "c" => self.finish(Finish::Copy, window, cx),
+                "s" => self.finish(Finish::Save, window, cx),
+                "p" => self.finish(Finish::Pin, window, cx),
+                _ => {}
+            }
+            return;
+        }
+
+        match key {
+            "escape" => self.cancel(window, cx),
+            "enter" => {
+                let mode = default_finish(cx);
+                self.finish(mode, window, cx);
+            }
+            // Tool shortcuts, mirroring the toolbar buttons. Digits are the
+            // primary binding; letters are there for muscle memory.
+            "1" | "r" => self.arm(Tool::Rect, window, cx),
+            "2" | "o" => self.arm(Tool::Ellipse, window, cx),
+            "3" | "p" => self.arm(Tool::Pen, window, cx),
+            "4" | "t" => self.arm(Tool::Text, window, cx),
+            "5" | "a" => self.arm(Tool::Arrow, window, cx),
+            "6" | "m" => self.arm(Tool::Mosaic, window, cx),
+            "7" | "e" => self.arm(Tool::Eraser, window, cx),
+            _ => {}
+        }
+    }
+
+    /// Arms a tool, or disarms it if it was already armed.
+    fn arm(&mut self, tool: Tool, window: &mut Window, cx: &mut Context<Self>) {
+        self.commit_text(window, cx);
+        self.tool = if self.tool == Some(tool) { None } else { Some(tool) };
+        cx.notify();
+    }
+
+    // -- rendering --------------------------------------------------------
+
+    /// The outline around the window the pointer is lighting up.
+    fn hover_chrome(&self) -> Vec<AnyElement> {
+        if self.selection.is_some() {
+            return Vec::new();
+        }
+        let Some(rect) = self.hover_rect else {
+            return Vec::new();
+        };
+        vec![
+            div()
+                .absolute()
+                .left(px(rect.x))
+                .top(px(rect.y))
+                .w(px(rect.w))
+                .h(px(rect.h))
+                .border_2()
+                .border_color(rgb(0x1E88E5))
+                .into_any_element(),
+            div()
+                .absolute()
+                .left(px(rect.x))
+                .top(px((rect.y - 22.0).max(0.0)))
+                .px(px(6.0))
+                .py(px(2.0))
+                .rounded(px(3.0))
+                .bg(rgba(0x0000_00CC))
+                .text_size(px(12.0))
+                .text_color(rgb(0xFFFFFF))
+                .child(format!(
+                    "{:.0} × {:.0}  点击选中该窗口",
+                    rect.w * self.map.0,
+                    rect.h * self.map.1
+                ))
+                .into_any_element(),
+        ]
+    }
+
+    /// The round area the painting tools will actually affect, drawn under the
+    /// pointer.
+    ///
+    /// The mosaic brush and the eraser are both round and both sized, so seeing
+    /// the circle is the difference between aiming and guessing. Two nested
+    /// rings (dark outside, light inside) keep it readable on any background.
+    fn brush_circle(&self) -> Option<AnyElement> {
+        let diameter = match self.tool? {
+            Tool::Mosaic => self.brush,
+            Tool::Eraser => self.eraser,
+            _ => return None,
+        };
+        let pointer = self.pointer?;
+        let half = diameter / 2.0;
+        Some(
+            div()
+                .absolute()
+                .left(px(pointer.x - half))
+                .top(px(pointer.y - half))
+                .w(px(diameter))
+                .h(px(diameter))
+                .rounded(px(half))
+                .border_1()
+                .border_color(rgba(0x0000_00B3))
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(1.0))
+                        .top(px(1.0))
+                        .w(px(diameter - 2.0))
+                        .h(px(diameter - 2.0))
+                        .rounded(px(half - 1.0))
+                        .border_1()
+                        .border_color(rgba(0xFFFF_FFD9)),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// The loupe: magnified pixels, the pointer's screen position and the colour
+    /// underneath it.
+    ///
+    /// It is only up while no region has been framed, which is exactly when the
+    /// user is deciding where to start.
+    fn magnifier_panel(&self) -> Option<AnyElement> {
+        if self.selection.is_some() {
+            return None;
+        }
+        let magnifier = self.magnifier.as_ref()?;
+        let pointer = self.pointer?;
+        let (view_w, view_h) = self.view_size();
+
+        let side = MAGNIFIER_CROP as f32 * MAGNIFIER_ZOOM as f32;
+        let (px_w, px_h) = (side + 8.0, side + 62.0);
+        // Sit under the pointer's bottom-right, flipping to the other side when
+        // it would leave the screen.
+        let mut left = pointer.x + MAGNIFIER_OFFSET;
+        let mut top = pointer.y + MAGNIFIER_OFFSET;
+        if left + px_w > view_w {
+            left = (pointer.x - MAGNIFIER_OFFSET - px_w).max(0.0);
+        }
+        if top + px_h > view_h {
+            top = (pointer.y - MAGNIFIER_OFFSET - px_h).max(0.0);
+        }
+        left = left.clamp(0.0, (view_w - px_w).max(0.0));
+        top = top.clamp(0.0, (view_h - px_h).max(0.0));
+
+        let (screen_x, screen_y) = self.screen_position(pointer);
+        let colour = self.pixel_colour(pointer);
+        let text = self.colour_text(colour);
+        let copied = self
+            .colour_copied
+            .map(|at| at.elapsed().as_millis() < 1200)
+            .unwrap_or(false);
+
+        Some(
+            div()
+                .id("xshot-loupe")
+                .absolute()
+                .left(px(left))
+                .top(px(top))
+                .w(px(px_w))
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(px(4.0))
+                .p(px(4.0))
+                .rounded(px(6.0))
+                .bg(rgba(0x1E1E_1EEB))
+                .border_1()
+                .border_color(rgba(0xFFFF_FF33))
+                .shadow_lg()
+                .child(
+                    div()
+                        .w(px(side))
+                        .h(px(side))
+                        .rounded(px(3.0))
+                        .border_1()
+                        .border_color(rgba(0xFFFF_FF40))
+                        .child(
+                            img(magnifier.image.clone())
+                                .w(px(side))
+                                .h(px(side))
+                                .object_fit(ObjectFit::Fill),
+                        ),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .text_size(px(11.5))
+                        .text_color(rgb(0xFFFFFF))
+                        .child(format!("{screen_x}, {screen_y}")),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(5.0))
+                        .child(
+                            div()
+                                .w(px(12.0))
+                                .h(px(12.0))
+                                .rounded(px(2.0))
+                                .bg(rgb(
+                                    (colour[0] as u32) << 16
+                                        | (colour[1] as u32) << 8
+                                        | colour[2] as u32,
+                                ))
+                                .border_1()
+                                .border_color(rgba(0xFFFF_FF59)),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.5))
+                                .text_color(rgb(0xFFFFFF))
+                                .child(text),
+                        ),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .text_size(px(10.5))
+                        .text_color(if copied {
+                            rgb(0x66BB6A)
+                        } else {
+                            rgba(0xFFFF_FF99)
+                        })
+                        .child(if copied {
+                            "已复制颜色值".to_string()
+                        } else {
+                            "Shift 切换 HEX/RGB · C 复制".to_string()
+                        }),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// The resize frame around a selected annotation.
+    ///
+    /// Same eight handles as the selection itself, so a rectangle can be
+    /// nudged to size after it has been drawn rather than redrawn.
+    fn shape_chrome(&self) -> Vec<AnyElement> {
+        let Some(index) = self.selected_shape else {
+            return Vec::new();
+        };
+        let Some(shape) = self.shapes.get(index) else {
+            return Vec::new();
+        };
+        if !matches!(shape, Shape::Rect { .. } | Shape::Ellipse { .. }) {
+            return Vec::new();
+        }
+        let bounds = shape.bounds();
+
+        let mut elements = vec![
+            div()
+                .absolute()
+                .left(px(bounds.x))
+                .top(px(bounds.y))
+                .w(px(bounds.w))
+                .h(px(bounds.h))
+                .border_1()
+                .border_color(rgba(0x60CD_FFAA))
+                .into_any_element(),
+        ];
+        for (_, point) in handle_points(&bounds) {
+            elements.push(
+                div()
+                    .absolute()
+                    .left(px(point.x - 3.5))
+                    .top(px(point.y - 3.5))
+                    .w(px(7.0))
+                    .h(px(7.0))
+                    .bg(rgb(0x1E88E5))
+                    .border_1()
+                    .border_color(rgb(0xFFFFFF))
+                    .into_any_element(),
+            );
+        }
+        elements
+    }
+
+    /// The darkened area outside the selection.
+    ///
+    /// Before anything is selected the whole desktop is dimmed: the overlay is
+    /// a mode, and showing that immediately is what tells the user the screen
+    /// has been frozen and they are expected to drag.
+    fn dim_mask(&self) -> Vec<AnyElement> {
+        let (view_w, view_h) = self.view_size();
+        // `rgba` takes 0xRRGGBBAA, so the alpha belongs in the *low* byte.
+        let alpha = (self.dim.clamp(0.0, 0.9) * 255.0).round() as u32;
+        let shade = rgba(alpha);
+
+        // The hole is whatever the user is currently pointing at: a dragged
+        // selection, or the window highlighted under the cursor.
+        let Some(selection) = self.selection.or(self.hover_rect) else {
+            return vec![
+                div()
+                    .absolute()
+                    .left_0()
+                    .top_0()
+                    .w_full()
+                    .h_full()
+                    .bg(shade)
+                    .into_any_element(),
+            ];
+        };
+
+        vec![
+            div()
+                .absolute()
+                .left_0()
+                .top_0()
+                .w_full()
+                .h(px(selection.y))
+                .bg(shade)
+                .into_any_element(),
+            div()
+                .absolute()
+                .left_0()
+                .top(px(selection.bottom()))
+                .w(px(view_w))
+                .h(px((view_h - selection.bottom()).max(0.0)))
+                .bg(shade)
+                .into_any_element(),
+            div()
+                .absolute()
+                .left_0()
+                .top(px(selection.y))
+                .w(px(selection.x))
+                .h(px(selection.h))
+                .bg(shade)
+                .into_any_element(),
+            div()
+                .absolute()
+                .left(px(selection.right()))
+                .top(px(selection.y))
+                .w(px((view_w - selection.right()).max(0.0)))
+                .h(px(selection.h))
+                .bg(shade)
+                .into_any_element(),
+        ]
+    }
+
+    fn selection_chrome(&self) -> Vec<AnyElement> {
+        let Some(selection) = self.selection else {
+            return Vec::new();
+        };
+        let mut elements = Vec::new();
+
+        elements.push(
+            div()
+                .absolute()
+                .left(px(selection.x))
+                .top(px(selection.y))
+                .w(px(selection.w))
+                .h(px(selection.h))
+                .border_1()
+                .border_color(rgb(0x1E88E5))
+                .into_any_element(),
+        );
+
+        for (_, point) in handle_points(&selection) {
+            elements.push(
+                div()
+                    .absolute()
+                    .left(px(point.x - 3.5))
+                    .top(px(point.y - 3.5))
+                    .w(px(7.0))
+                    .h(px(7.0))
+                    .bg(rgb(0xFFFFFF))
+                    .border_1()
+                    .border_color(rgb(0x1E88E5))
+                    .into_any_element(),
+            );
+        }
+
+        // Size badge, above the selection when there is room for it.
+        let label_y = if selection.y >= 24.0 { selection.y - 22.0 } else { selection.y + 2.0 };
+        elements.push(
+            div()
+                .absolute()
+                .left(px(selection.x))
+                .top(px(label_y))
+                .px(px(6.0))
+                .py(px(2.0))
+                .rounded(px(3.0))
+                .bg(rgba(0x0000_00CC))
+                .text_size(px(12.0))
+                .text_color(rgb(0xFFFFFF))
+                .child(format!(
+                    "{:.0} × {:.0}",
+                    selection.w * self.map.0,
+                    selection.h * self.map.1
+                ))
+                .into_any_element(),
+        );
+
+        elements
+    }
+
+    /// Mosaic strokes, shown as bitmaps rather than vectors.
+    ///
+    /// The preview is generated from the very pixels, brush and block size the
+    /// final composite will use, so the blurred region on screen is exactly
+    /// what gets saved.
+    fn mosaic_elements(&self) -> Vec<AnyElement> {
+        let mut elements = Vec::new();
+        let mut push = |shape: &Shape| {
+            if let Shape::Mosaic { preview: Some(preview), .. } = shape {
+                elements.push(
+                    img(preview.image.clone())
+                        .absolute()
+                        .left(px(preview.rect.x))
+                        .top(px(preview.rect.y))
+                        .w(px(preview.rect.w))
+                        .h(px(preview.rect.h))
+                        .object_fit(ObjectFit::Fill)
+                        .into_any_element(),
+                );
+            }
+        };
+        for shape in &self.shapes {
+            push(shape);
+        }
+        if let Some(draft) = &self.draft {
+            push(draft);
+        }
+        elements
+    }
+
+    /// All vector annotations, painted through one GPUI canvas.
+    fn vector_canvas(&self) -> AnyElement {
+        let shapes = self.preview_shapes();
+        canvas(
+            move |_bounds, _window, _cx| shapes,
+            move |_bounds, shapes, window, _cx| {
+                for shape in &shapes {
+                    if let Shape::Arrow { a, b, color, width } = shape {
+                        if let Some((shaft, tip)) = arrow_paths(*a, *b, *width) {
+                            window.paint_path(shaft, rgb(*color));
+                            window.paint_path(tip, rgb(*color));
+                        }
+                        continue;
+                    }
+                    let Some((path, color)) = shape_path(shape) else {
+                        continue;
+                    };
+                    window.paint_path(path, rgb(color));
+                }
+            },
+        )
+        .absolute()
+        .left_0()
+        .top_0()
+        .w_full()
+        .h_full()
+        .into_any_element()
+    }
+
+    fn text_elements(&self) -> Vec<AnyElement> {
+        let mut elements = Vec::new();
+        for shape in &self.shapes {
+            if let Shape::Text { pos, text, color, size } = shape {
+                elements.push(text_element(*pos, text, *color, *size));
+            }
+        }
+        if let Some(edit) = &self.text {
+            // The composition string from the IME shows up here as ordinary
+            // text while it is still being edited.
+            elements.push(text_element(edit.origin, &edit.text, self.color, 20.0));
+            let caret_x = edit.origin.x + measure(&edit.text, 20.0);
+            elements.push(
+                div()
+                    .absolute()
+                    .left(px(caret_x))
+                    .top(px(edit.origin.y))
+                    .w(px(1.5))
+                    .h(px(20.0 * 1.3))
+                    .bg(rgb(self.color))
+                    .into_any_element(),
+            );
+        }
+        elements
+    }
+
+    /// Registers this view as the platform text input handler, which is what
+    /// makes IME composition (e.g. pinyin) work.
+    ///
+    /// The handler is registered for the window's whole life, and
+    /// [`EntityInputHandler::accepts_text_input`] reports whether a box is
+    /// actually open. GPUI never clears a platform input handler once it has
+    /// been set, so removing it here would leave the window permanently
+    /// believing it is a text field — every character-producing key would then
+    /// sit in a one-second disambiguation buffer, and the Enter that finishes
+    /// a shot would never arrive.
+    fn input_layer(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let entity = cx.entity();
+        let focus = self.focus.clone();
+        Some(
+            canvas(
+                move |bounds, _window, _cx| bounds,
+                move |bounds, _bounds, window, cx| {
+                    window.handle_input(
+                        &focus,
+                        ElementInputHandler::new(bounds, entity.clone()),
+                        cx,
+                    );
+                },
+            )
+            .absolute()
+            .left_0()
+            .top_0()
+            .w_full()
+            .h_full()
+            .into_any_element(),
+        )
+    }
+
+    fn toolbar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let selection = self.selection?;
+        let (view_w, view_h) = self.view_size();
+
+        // Sit under the selection's bottom-right corner, flipping above it when
+        // there is not enough room below.
+        let below = selection.bottom() + 8.0;
+        let top = if below + TOOLBAR_HEIGHT <= view_h {
+            below
+        } else {
+            (selection.y - TOOLBAR_HEIGHT - 8.0).max(0.0)
+        };
+        let right = (view_w - selection.right()).max(0.0);
+
+        let armed = self.tool;
+        let color = self.color;
+        let width = self.width;
+
+        let group = |label: &'static str, active: bool, action: Action| -> AnyElement {
+            div()
+                .id(label)
+                .flex()
+                .items_center()
+                .justify_center()
+                .h(px(24.0))
+                .px(px(8.0))
+                .rounded(px(4.0))
+                .text_size(px(12.0))
+                .text_color(if active { rgb(0xFFFFFF) } else { rgb(0xD8D8D8) })
+                .bg(if active { rgb(0x1E88E5) } else { rgba(0x0000_0000) })
+                .cursor_pointer()
+                .hover(|style| style.bg(rgb(0x3C3C3C)))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _event, window, cx| {
+                        this.apply(action, window, cx);
+                        cx.stop_propagation();
+                    }),
+                )
+                .child(label)
+                .into_any_element()
+        };
+
+        let tools: Vec<AnyElement> = [
+            Tool::Rect,
+            Tool::Ellipse,
+            Tool::Arrow,
+            Tool::Pen,
+            Tool::Mosaic,
+            Tool::Eraser,
+            Tool::Text,
+        ]
+        .into_iter()
+        .map(|tool| group(tool.label(), armed == Some(tool), Action::Arm(tool)))
+        .collect();
+
+        let swatches: Vec<AnyElement> = PALETTE
+            .into_iter()
+            .map(|value| {
+                let active = value == color;
+                div()
+                    .id(("swatch", value))
+                    .w(px(16.0))
+                    .h(px(16.0))
+                    .rounded(px(8.0))
+                    .bg(rgb(value))
+                    .border_1()
+                    .border_color(if active { rgb(0xFFFFFF) } else { rgba(0xFFFF_FF33) })
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _event, window, cx| {
+                            this.apply(Action::Stroke(value), window, cx);
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+
+        // The size row is context sensitive: a mosaic picks its brush width and
+        // block size, the eraser its reach, everything else its stroke width.
+        let brush = self.brush;
+        let block = self.block;
+        let eraser = self.eraser;
+        let size_action: Action;
+        let sizes_source: &[f32];
+        let sizes_current: f32;
+        let sizes_kind: &'static str;
+        let sizes_label: &'static str;
+        match armed {
+            Some(Tool::Mosaic) => {
+                size_action = Action::Brush(0.0);
+                sizes_source = &BRUSHES;
+                sizes_current = brush;
+                sizes_kind = "brush";
+                sizes_label = "笔刷";
+            }
+            Some(Tool::Eraser) => {
+                size_action = Action::EraserSize(0.0);
+                sizes_source = &ERASERS;
+                sizes_current = eraser;
+                sizes_kind = "eraser";
+                sizes_label = "橡皮直径";
+            }
+            _ => {
+                size_action = Action::Weight(0.0);
+                sizes_source = &WIDTHS;
+                sizes_current = width;
+                sizes_kind = "weight";
+                sizes_label = "线宽";
+            }
+        }
+        let sizes: Vec<AnyElement> = sizes_source
+            .iter()
+            .copied()
+            .map(|value| {
+                let active = (value - sizes_current).abs() < 0.01;
+                div()
+                    .id((sizes_kind, (value * 10.0) as u32))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(px(22.0))
+                    .h(px(20.0))
+                    .rounded(px(4.0))
+                    .cursor_pointer()
+                    .bg(if active { rgb(0x1E88E5) } else { rgba(0x0000_0000) })
+                    .hover(|style| style.bg(rgb(0x3C3C3C)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _event, window, cx| {
+                            let action = match size_action {
+                                Action::Brush(_) => Action::Brush(value),
+                                Action::EraserSize(_) => Action::EraserSize(value),
+                                _ => Action::Weight(value),
+                            };
+                            this.apply(action, window, cx);
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .child({
+                        // The eraser and the mosaic brush are round, so their
+                        // buttons show a dot of the real diameter; stroke widths
+                        // stay a bar.
+                        let (w, h) = if sizes_kind == "eraser" {
+                            let diameter = (value / 3.0).clamp(5.0, 15.0);
+                            (diameter, diameter)
+                        } else {
+                            ((value / 2.5).clamp(4.0, 16.0), (value / 5.0).clamp(2.0, 6.0))
+                        };
+                        div()
+                            .w(px(w))
+                            .h(px(h))
+                            .rounded(px(h / 2.0))
+                            .bg(rgb(0xFFFFFF))
+                    })
+                    .into_any_element()
+            })
+            .collect();
+
+        // The mosaic also exposes its block size, which is a separate knob from
+        // how wide the brush paints.
+        let mut block_row: Vec<AnyElement> = Vec::new();
+        if armed == Some(Tool::Mosaic) {
+            for value in [6.0f32, 10.0, 16.0] {
+                let active = (value - block).abs() < 0.01;
+                block_row.push(
+                    div()
+                        .id(("block", (value * 10.0) as u32))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .w(px(22.0))
+                        .h(px(20.0))
+                        .rounded(px(4.0))
+                        .text_size(px(10.5))
+                        .text_color(rgb(0xFFFFFF))
+                        .cursor_pointer()
+                        .bg(if active { rgb(0x1E88E5) } else { rgba(0x0000_0000) })
+                        .hover(|style| style.bg(rgb(0x3C3C3C)))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _event, window, cx| {
+                                this.apply(Action::Block(value), window, cx);
+                                cx.stop_propagation();
+                            }),
+                        )
+                        .child(format!("{value:.0}"))
+                        .into_any_element(),
+                );
+            }
+        }
+
+        let actions = vec![
+            group("撤销", false, Action::Undo),
+            group("钉图", false, Action::Pin),
+            group("保存", false, Action::Save),
+            group("复制", false, Action::Copy),
+            group("取消", false, Action::Cancel),
+        ];
+
+        // A one-line reminder of what the armed tool does.
+        let hint = armed.map(|tool| {
+            div()
+                .px(px(6.0))
+                .text_size(px(11.0))
+                .text_color(rgba(0xFFFF_FF8C))
+                .child(tool.hint())
+                .into_any_element()
+        });
+
+        let divider = || {
+            div()
+                .w(px(1.0))
+                .h(px(18.0))
+                .bg(rgba(0xFFFF_FF33))
+                .into_any_element()
+        };
+
+        Some(
+            div()
+                .id("xshot-toolbar")
+                .absolute()
+                .right(px(right))
+                .top(px(top))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(4.0))
+                .px(px(6.0))
+                .py(px(5.0))
+                .rounded(px(7.0))
+                .bg(rgba(0x1E1E_1EF2))
+                .border_1()
+                .border_color(rgba(0xFFFF_FF26))
+                .shadow_lg()
+                .children(tools)
+                .child(divider())
+                .children(swatches)
+                .child(divider())
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(rgba(0xFFFF_FFB3))
+                        .child(sizes_label),
+                )
+                .children(sizes)
+                .children(block_row)                .child(divider())
+                .children(actions)
+                .children(hint)
+                .into_any_element(),
+        )
+    }
+}
+
+impl Render for Overlay {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Measured rather than assumed, so the frame maps onto whatever client
+        // area the compositor actually gave us.
+        if !self.shift_watcher {
+            self.shift_watcher = true;
+            Self::watch_shift(cx);
+        }
+        self.scale = window.scale_factor();
+        let client = window.bounds().size;
+        let (client_w, client_h) = (client.width.as_f32(), client.height.as_f32());
+        if client_w > 0.0 && client_h > 0.0 {
+            self.view_size = (client_w, client_h);
+            self.map = (self.frame_size.0 / client_w, self.frame_size.1 / client_h);
+        }
+
+        let mut root = div()
+            .id("xshot-overlay-root")
+            .relative()
+            .size_full()
+            .overflow_hidden()
+            .bg(rgb(0x000000))
+            .track_focus(&self.focus)
+            .on_key_down(cx.listener(Self::on_key_down))
+            .child(
+                img(self.image.clone())
+                    .absolute()
+                    .left_0()
+                    .top_0()
+                    .w_full()
+                    .h_full()
+                    .object_fit(ObjectFit::Fill),
+            )
+            .children(self.dim_mask())
+            .child(self.vector_canvas())
+            .children(self.mosaic_elements())
+            .children(self.text_elements())
+            .children(self.selection_chrome())
+            .children(self.shape_chrome())
+            .children(self.hover_chrome())
+            .children(self.brush_circle())
+            .children(self.magnifier_panel());
+
+        if let Some(input) = self.input_layer(cx) {
+            root = root.child(input);
+        }
+
+        // A transparent full-window hit area: clicks anywhere that the toolbar
+        // does not cover drive the selection and the drawing tools.
+        root = root.child(
+            div()
+                .id("xshot-capture-surface")
+                .absolute()
+                .left_0()
+                .top_0()
+                .w_full()
+                .h_full()
+                .cursor(self.cursor.unwrap_or(CursorStyle::Crosshair))
+                .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+                .on_mouse_down(MouseButton::Right, cx.listener(Self::on_mouse_down))
+                .on_mouse_move(cx.listener(Self::on_mouse_move))
+                .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up)),
+        );
+
+        if let Some(toolbar) = self.toolbar(cx) {
+            root = root.child(toolbar);
+        }
+
+        root
+    }
+}
+
+impl EntityInputHandler for Overlay {
+    fn text_for_range(
+        &mut self,
+        range: Range<usize>,
+        adjusted_range: &mut Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let edit = self.text.as_ref()?;
+        let start = utf8_index_for_utf16(&edit.text, range.start);
+        let end = utf8_index_for_utf16(&edit.text, range.end);
+        *adjusted_range = Some(range);
+        Some(edit.text[start..end].to_string())
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        let edit = self.text.as_ref()?;
+        Some(UTF16Selection {
+            range: edit.selection.clone(),
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
+        self.text.as_ref()?.marked.clone()
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+        if let Some(edit) = self.text.as_mut() {
+            edit.marked = None;
+        }
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        range: Option<Range<usize>>,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // While a text box is open GPUI sends printable keys down its text
+        // input path, and keystrokes that produce a character — Enter, above
+        // all — stop being delivered to `on_key_down`. Anything that carries
+        // meaning for the box is therefore handled here as well; the two paths
+        // cannot double-fire because each only commits while a box is open.
+        if self.text.is_some() {
+            let mut handled = false;
+            for character in text.chars() {
+                match character {
+                    '\r' | '\n' => {
+                        self.commit_text(window, cx);
+                        handled = true;
+                    }
+                    '\u{1b}' => {
+                        self.text = None;
+                        handled = true;
+                    }
+                    '\u{8}' | '\u{7f}' => {
+                        self.backspace();
+                        handled = true;
+                    }
+                    _ => {}
+                }
+            }
+            if handled {
+                cx.notify();
+                return;
+            }
+        }
+
+        let cleaned: String = text.chars().filter(|c| !c.is_control()).collect();
+        if cleaned.is_empty() {
+            return;
+        }
+        self.splice(range, &cleaned, false, None);
+        cx.notify();
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range: Option<Range<usize>>,
+        new_text: &str,
+        new_selected_range: Option<Range<usize>>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let cleaned: String = new_text.chars().filter(|c| !c.is_control()).collect();
+        self.splice(range, &cleaned, true, new_selected_range);
+        cx.notify();
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _range: Range<usize>,
+        _element_bounds: Bounds<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        let edit = self.text.as_ref()?;
+        Some(Bounds {
+            origin: point(px(edit.origin.x), px(edit.origin.y)),
+            size: size(px(240.0), px(26.0)),
+        })
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        None
+    }
+
+    fn text_length_utf16(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        Some(utf16_len(&self.text.as_ref()?.text))
+    }
+
+    /// Reports a text field only while a text box is open.
+    ///
+    /// GPUI consults this before holding a keystroke back for multi-key
+    /// disambiguation, so returning `false` keeps the toolbar shortcuts and the
+    /// Enter that finishes the shot instantaneous.
+    fn accepts_text_input(&self, _window: &mut Window, _cx: &mut Context<Self>) -> bool {
+        self.text.is_some()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// helpers
+
+/// What the finishing gesture should produce, per the user's preference.
+fn default_finish(cx: &App) -> Finish {
+    match app::state(cx).config.finish_action {
+        crate::config::FinishAction::Copy => Finish::Copy,
+        crate::config::FinishAction::Save => Finish::Save,
+        crate::config::FinishAction::Pin => Finish::Pin,
+    }
+}
+
+fn text_element(position: Pt, text: &str, color: u32, size: f32) -> AnyElement {
+    let mut element = div()
+        .absolute()
+        .left(px(position.x))
+        .top(px(position.y))
+        .text_size(px(size))
+        .text_color(rgb(color));
+    for line in text.split('\n') {
+        element = element.child(div().child(line.to_string()));
+    }
+    element.into_any_element()
+}
+
+/// Approximate advance width, only used to place the caret.
+fn measure(text: &str, size: f32) -> f32 {
+    text.chars()
+        .map(|c| if c.is_ascii() { size * 0.55 } else { size })
+        .sum()
+}
+
+fn handle_points(selection: &Rect) -> [(Handle, Pt); 8] {
+    let center = selection.center();
+    [
+        (Handle::NW, Pt::new(selection.x, selection.y)),
+        (Handle::N, Pt::new(center.x, selection.y)),
+        (Handle::NE, Pt::new(selection.right(), selection.y)),
+        (Handle::E, Pt::new(selection.right(), center.y)),
+        (Handle::SE, Pt::new(selection.right(), selection.bottom())),
+        (Handle::S, Pt::new(center.x, selection.bottom())),
+        (Handle::SW, Pt::new(selection.x, selection.bottom())),
+        (Handle::W, Pt::new(selection.x, center.y)),
+    ]
+}
+
+fn hit_handle(position: Pt, selection: &Rect) -> Option<Handle> {
+    handle_points(selection)
+        .into_iter()
+        .find(|(_, point)| {
+            (point.x - position.x).abs() <= HANDLE_GRAB && (point.y - position.y).abs() <= HANDLE_GRAB
+        })
+        .map(|(handle, _)| handle)
+}
+
+fn resize(original: Rect, handle: Handle, position: Pt, view_w: f32, view_h: f32) -> Rect {
+    let mut left = original.x;
+    let mut top = original.y;
+    let mut right = original.right();
+    let mut bottom = original.bottom();
+
+    match handle {
+        Handle::NW => {
+            left = position.x;
+            top = position.y;
+        }
+        Handle::N => top = position.y,
+        Handle::NE => {
+            right = position.x;
+            top = position.y;
+        }
+        Handle::E => right = position.x,
+        Handle::SE => {
+            right = position.x;
+            bottom = position.y;
+        }
+        Handle::S => bottom = position.y,
+        Handle::SW => {
+            left = position.x;
+            bottom = position.y;
+        }
+        Handle::W => left = position.x,
+    }
+
+    let left = left.clamp(0.0, view_w);
+    let right = right.clamp(0.0, view_w);
+    let top = top.clamp(0.0, view_h);
+    let bottom = bottom.clamp(0.0, view_h);
+    Rect::new(
+        left.min(right),
+        top.min(bottom),
+        (right - left).abs().max(1.0),
+        (bottom - top).abs().max(1.0),
+    )
+}
+
+/// Tessellates one annotation into a GPUI path.
+fn shape_path(shape: &Shape) -> Option<(Path<Pixels>, u32)> {
+    match shape {
+        Shape::Rect { a, b, color, width } => {
+            let mut builder = PathBuilder::stroke(px(*width));
+            builder.move_to(point(px(a.x), px(a.y)));
+            builder.line_to(point(px(b.x), px(a.y)));
+            builder.line_to(point(px(b.x), px(b.y)));
+            builder.line_to(point(px(a.x), px(b.y)));
+            builder.close();
+            builder.build().ok().map(|path| (path, *color))
+        }
+        Shape::Ellipse { a, b, color, width } => {
+            let center_x = (a.x + b.x) / 2.0;
+            let center_y = (a.y + b.y) / 2.0;
+            let radius_x = (b.x - a.x).abs() / 2.0;
+            let radius_y = (b.y - a.y).abs() / 2.0;
+            if radius_x < 0.5 || radius_y < 0.5 {
+                return None;
+            }
+            // The usual 4-arc Bezier approximation of an ellipse.
+            const KAPPA: f32 = 0.552_284_75;
+            let kx = radius_x * KAPPA;
+            let ky = radius_y * KAPPA;
+            let mut builder = PathBuilder::stroke(px(*width));
+            builder.move_to(point(px(center_x + radius_x), px(center_y)));
+            builder.cubic_bezier_to(
+                point(px(center_x), px(center_y + radius_y)),
+                point(px(center_x + radius_x), px(center_y + ky)),
+                point(px(center_x + kx), px(center_y + radius_y)),
+            );
+            builder.cubic_bezier_to(
+                point(px(center_x - radius_x), px(center_y)),
+                point(px(center_x - kx), px(center_y + radius_y)),
+                point(px(center_x - radius_x), px(center_y + ky)),
+            );
+            builder.cubic_bezier_to(
+                point(px(center_x), px(center_y - radius_y)),
+                point(px(center_x - radius_x), px(center_y - ky)),
+                point(px(center_x - kx), px(center_y - radius_y)),
+            );
+            builder.cubic_bezier_to(
+                point(px(center_x + radius_x), px(center_y)),
+                point(px(center_x + kx), px(center_y - radius_y)),
+                point(px(center_x + radius_x), px(center_y - ky)),
+            );
+            builder.close();
+            builder.build().ok().map(|path| (path, *color))
+        }
+        Shape::Pen { points, color, width } => {
+            if points.is_empty() {
+                return None;
+            }
+            let mut builder = PathBuilder::stroke(px(*width));
+            builder.move_to(point(px(points[0].x), px(points[0].y)));
+            if points.len() == 1 {
+                // A single dot still needs a closed contour to be filled.
+                let half = width / 2.0;
+                builder.line_to(point(px(points[0].x + half), px(points[0].y)));
+                builder.line_to(point(px(points[0].x + half), px(points[0].y + half)));
+            } else {
+                for next in &points[1..] {
+                    builder.line_to(point(px(next.x), px(next.y)));
+                }
+            }
+            builder.build().ok().map(|path| (path, *color))
+        }
+        Shape::Arrow { .. } | Shape::Text { .. } | Shape::Mosaic { .. } => None,
+    }
+}
+
+/// The two primitives an arrow is made of: a stroked shaft and a solid head.
+fn arrow_paths(a: Pt, b: Pt, width: f32) -> Option<(Path<Pixels>, Path<Pixels>)> {
+    let dx = b.x - a.x;
+    let dy = b.y - a.y;
+    let length = (dx * dx + dy * dy).sqrt();
+    if length < 1.0 {
+        return None;
+    }
+    let head = (width * ARROW_HEAD_LENGTH).min(length * 0.6).max(6.0);
+    let half = head * ARROW_HEAD_HALF_WIDTH / ARROW_HEAD_LENGTH;
+    let (ux, uy) = (dx / length, dy / length);
+
+    // Stop the shaft at the base of the head so it does not show through.
+    let mut shaft = PathBuilder::stroke(px(width));
+    shaft.move_to(point(px(a.x), px(a.y)));
+    shaft.line_to(point(px(b.x - ux * head), px(b.y - uy * head)));
+
+    let mut tip = PathBuilder::fill();
+    tip.move_to(point(px(b.x), px(b.y)));
+    tip.line_to(point(
+        px(b.x - ux * head - uy * half),
+        px(b.y - uy * head + ux * half),
+    ));
+    tip.line_to(point(
+        px(b.x - ux * head + uy * half),
+        px(b.y - uy * head - ux * half),
+    ));
+    tip.close();
+
+    Some((shaft.build().ok()?, tip.build().ok()?))
+}
+
+fn utf16_len(text: &str) -> usize {
+    text.chars().map(char::len_utf16).sum()
+}
+
+fn utf16_len_upto(text: &str, byte_index: usize) -> usize {
+    text[..byte_index].chars().map(char::len_utf16).sum()
+}
+
+fn utf8_index_for_utf16(text: &str, target: usize) -> usize {
+    let mut units = 0;
+    for (index, character) in text.char_indices() {
+        if units >= target {
+            return index;
+        }
+        units += character.len_utf16();
+    }
+    text.len()
+}
+
+fn utf16_index_for_utf8(text: &str, target: usize) -> usize {
+    utf16_len_upto(text, target.min(text.len()))
+}
