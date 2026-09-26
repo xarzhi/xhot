@@ -18,7 +18,9 @@ const FAMILY: &str = "iconfont";
 /// One code point per glyph, straight from `assets/iconfont/iconfont.json`.
 ///
 /// The font also carries `up-arrow`, `down-arrow`, `right-arrow` and
-/// `left-arrow` (`e642`, `e643`, `eca7`, `eca8`) which nothing draws yet.
+/// `left-arrow` (`e642`, `e643`, `eca7`, `eca8`), plus `长截图` (`e601`) and
+/// `录屏` (`e60a`) which the long-shot and recording buttons will want when they
+/// come back — nothing draws any of them yet.
 pub mod glyph {
     pub const ARROW: &str = "\u{e630}";
     pub const SAVE: &str = "\u{ec09}";
@@ -35,6 +37,13 @@ pub mod glyph {
     pub const MINIMIZE: &str = "\u{e711}";
     pub const MAXIMIZE: &str = "\u{e655}";
     pub const CLOSE: &str = "\u{e609}";
+    /// The pencil, which the font files under `编辑`.
+    ///
+    /// Until this glyph existed the pencil was stroked by hand in a 16-unit box;
+    /// the font's own drawing replaced it, so the whole toolbar is now one set.
+    pub const PEN: &str = "\u{e600}";
+    /// The letter T, which the font files under `文字`.
+    pub const TEXT: &str = "\u{e732}";
 }
 
 /// Registers the font. Call once, before the first window exists.
@@ -67,57 +76,4 @@ pub fn labelled(glyph: &'static str, box_size: f32, color: Rgba, font_size: f32)
         .text_color(color)
         .child(glyph)
         .into_any_element()
-}
-
-/// The two glyphs the icon font does not have.
-///
-/// `iconfont.json` covers the capture tools and the window buttons but stops
-/// short of the pencil and the text tool, so those are stroked by hand in the
-/// same 16-unit box and at the same weight, which keeps them from standing out.
-/// Adding `pen` / `text` to the iconfont would replace them with one line each.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Drawn {
-    Pen,
-    Text,
-}
-
-/// A hand-stroked icon, centred in a `size` × `size` box.
-pub fn drawn(kind: Drawn, size: f32, color: Rgba) -> AnyElement {
-    let scale = size / 16.0;
-    canvas(
-        |_, _, _| (),
-        move |bounds, _, window, _| {
-            let origin = bounds.origin;
-            let at = |x: f32, y: f32| point(origin.x + px(x * scale), origin.y + px(y * scale));
-            // The font's own strokes are about 1.4 units wide in this box.
-            let mut builder = PathBuilder::stroke(px(1.4 * scale));
-            match kind {
-                Drawn::Pen => {
-                    // Body, then the sharpened tip, so it reads as a pencil and
-                    // not just a diagonal bar.
-                    builder.move_to(at(4.4, 11.6));
-                    builder.line_to(at(10.4, 5.6));
-                    builder.line_to(at(12.0, 7.2));
-                    builder.line_to(at(6.0, 13.2));
-                    builder.close();
-                    builder.move_to(at(3.0, 14.0));
-                    builder.line_to(at(3.6, 11.2));
-                    builder.line_to(at(6.0, 13.2));
-                }
-                Drawn::Text => {
-                    // A capital T: the bar, then the stem.
-                    builder.move_to(at(3.4, 4.0));
-                    builder.line_to(at(12.6, 4.0));
-                    builder.move_to(at(8.0, 4.0));
-                    builder.line_to(at(8.0, 13.0));
-                }
-            }
-            if let Ok(path) = builder.build() {
-                window.paint_path(path, color);
-            }
-        },
-    )
-    .w(px(size))
-    .h(px(size))
-    .into_any_element()
 }

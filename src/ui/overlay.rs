@@ -349,9 +349,9 @@ pub struct Overlay {
 
 /// Which icon a toolbar button shows.
 ///
-/// The icon font covers the tools and the actions; the pencil and the text tool
-/// are stroked by hand (see [`crate::ui::icons::Drawn`]) because the set has no
-/// glyph for them.
+/// Every one of them is a glyph in the icon font — the pencil and the text tool
+/// used to be stroked by hand because the set had nothing for them, and the font
+/// has since grown `编辑` and `文字`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Art {
     Tool(Tool),
@@ -376,15 +376,15 @@ impl Art {
     }
 
     fn element(self, size: f32, color: Rgba) -> AnyElement {
-        use crate::ui::icons::{self, Drawn, glyph};
+        use crate::ui::icons::{self, glyph};
         match self {
             Art::Tool(Tool::Rect) => icons::icon(glyph::RECT, size, color),
             Art::Tool(Tool::Ellipse) => icons::icon(glyph::CIRCLE, size, color),
             Art::Tool(Tool::Arrow) => icons::icon(glyph::ARROW, size, color),
-            Art::Tool(Tool::Pen) => icons::drawn(Drawn::Pen, size, color),
+            Art::Tool(Tool::Pen) => icons::icon(glyph::PEN, size, color),
             Art::Tool(Tool::Mosaic) => icons::icon(glyph::MOSAIC, size, color),
             Art::Tool(Tool::Eraser) => icons::icon(glyph::RUBBER, size, color),
-            Art::Tool(Tool::Text) => icons::drawn(Drawn::Text, size, color),
+            Art::Tool(Tool::Text) => icons::icon(glyph::TEXT, size, color),
             Art::Undo => icons::icon(glyph::REVOKE, size, color),
             Art::Pin => icons::icon(glyph::PIN, size, color),
             Art::Save => icons::icon(glyph::SAVE, size, color),

@@ -6,6 +6,34 @@
   "description": "",
   "glyphs": [
     {
+      "icon_id": "38173400",
+      "name": "长截图",
+      "font_class": "changjietu",
+      "unicode": "e601",
+      "unicode_decimal": 58881
+    },
+    {
+      "icon_id": "12791523",
+      "name": "录屏",
+      "font_class": "record",
+      "unicode": "e60a",
+      "unicode_decimal": 58890
+    },
+    {
+      "icon_id": "7193685",
+      "name": "文字",
+      "font_class": "wenzi",
+      "unicode": "e732",
+      "unicode_decimal": 59186
+    },
+    {
+      "icon_id": "1264",
+      "name": "编辑",
+      "font_class": "bianji",
+      "unicode": "e600",
+      "unicode_decimal": 58880
+    },
+    {
       "icon_id": "2279255",
       "name": "箭头",
       "font_class": "arrow",
