@@ -59,8 +59,32 @@ static REGION: Mutex<Option<(i32, i32, i32, i32)>> = Mutex::new(None);
 static STARTED: Mutex<Option<Instant>> = Mutex::new(None);
 static FRAMES: AtomicUsize = AtomicUsize::new(0);
 
+/// What a session should do with what it has collected when it stops.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Ending {
+    /// Hand the shot to the clipboard.
+    Copy,
+    /// Throw it away and put the framing tools back.
+    Discard,
+}
+
+/// Set by whoever stops the session, so the worker knows where the result goes.
+static ENDING: Mutex<Option<Ending>> = Mutex::new(None);
+
 pub fn is_active() -> bool {
     ACTIVE.load(Ordering::SeqCst)
+}
+
+/// Ends a session, saying what to do with the result.
+///
+/// The toolbar's own buttons use this: they run while the session is still
+/// collecting, so they cannot hand the shot over themselves — they say what they
+/// want and let the worker finish.
+pub fn finish_with(ending: Ending) {
+    *ENDING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(ending);
+    stop();
 }
 
 /// Whether frames are currently being written.
@@ -134,16 +158,34 @@ pub fn start_scrolling(cx: &mut App, region: (i32, i32, i32, i32)) {
             .background_executor()
             .spawn(async move { scroll_loop(region) })
             .await;
-        let _ = cx.update(|cx| match stitched {
-            // The shot is finished, so the capture is over: hand it to the save
-            // window and let the overlay go.
-            Some(shot) => {
+        // Whoever stopped it said what to do with the result; Esc says "keep
+        // what you have", because throwing away a long page the user has just
+        // scrolled through is the worse surprise.
+        let ending = ENDING
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .unwrap_or(Ending::Copy);
+        let _ = cx.update(|cx| match (stitched, ending) {
+            (Some(shot), Ending::Copy) => {
                 crate::timing("s stitching done");
                 end_session(cx, false);
-                crate::ui::save_dialog::open(cx, shot);
+                match crate::win::clip::copy_image(&shot) {
+                    Ok(()) => tray::notify("长截图已复制到剪贴板"),
+                    Err(error) => {
+                        eprintln!("xshot: clipboard write failed: {error:#}");
+                        tray::notify("长截图复制失败");
+                    }
+                }
+            }
+            // Abandoned: the rows that were collected go, and the framing tools
+            // come back so the user can pick a different region.
+            (_, Ending::Discard) => {
+                crate::timing("s discarded");
+                end_session(cx, true);
             }
             // Nothing usable: put the user back where they were.
-            None => {
+            (None, _) => {
                 crate::timing("s nothing to stitch");
                 end_session(cx, true);
                 tray::notify("长截图没有采集到可拼接的内容");

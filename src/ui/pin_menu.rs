@@ -15,6 +15,7 @@ use crate::ui::theme::{RADIUS_CARD, RADIUS_CONTROL, TEXT_BODY, Theme};
 pub enum MenuChoice {
     CopyImage,
     CopyText,
+    Edit,
     ToggleShadow,
     Save,
     Close,
@@ -52,6 +53,12 @@ impl PinMenu {
                 },
                 choice: MenuChoice::CopyText,
                 enabled: has_text,
+                separator_after: true,
+            },
+            Item {
+                label: "编辑".into(),
+                choice: MenuChoice::Edit,
+                enabled: true,
                 separator_after: true,
             },
             Item {

@@ -17,7 +17,7 @@ use crate::annot::{BRUSHES, ERASERS, MosaicPreview, PALETTE, Pt, Rect, Shape, To
 use crate::app;
 use crate::win::frame::Dib;
 use crate::win::util as win_util;
-use crate::win::{clip, paint};
+use crate::win::{clip, paint, tray};
 
 /// What committing the current selection should produce.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +46,10 @@ enum Action {
     Block(f32),
     Undo,
     LongShot,
+    /// Keep what a session has stitched (the toolbar's 复制).
+    SessionKeep,
+    /// Abandon a session (the toolbar's 关闭).
+    SessionDiscard,
     Copy,
     Save,
     Pin,
@@ -76,6 +80,22 @@ impl Handle {
         }
     }
 }
+
+/// How thick a session's frame is drawn, in logical pixels.
+///
+/// It sits on the *outside* of the region, so it costs the shot nothing.
+const FRAME_THICKNESS: f32 = 4.0;
+/// The gap between the framed region and the drawn frame, in logical pixels.
+const FRAME_GAP: f32 = 3.0;
+/// How far the window's region reaches past the drawn frame, in logical pixels.
+const REGION_SLACK: f32 = 2.0;
+/// The session toolbar's size, in logical pixels.
+///
+/// Fixed rather than measured: its rectangle is added to the window's region so
+/// the two buttons can still be clicked while every other pixel belongs to the
+/// application underneath, and a region is set from numbers, not from a painted
+/// layout. Two 28 px buttons, their gap and the padding.
+const SESSION_TOOLBAR_SIZE: (f32, f32) = (76.0, 38.0);
 
 /// An interaction currently in flight.
 #[derive(Debug, Clone)]
@@ -382,6 +402,8 @@ enum Art {
     Undo,
     /// Stitch a scrolling window into one tall shot.
     LongShot,
+    /// Keep what a session has stitched, and hand it over.
+    SessionKeep,
     Pin,
     Save,
     Copy,
@@ -395,6 +417,7 @@ impl Art {
             Art::Tool(tool) => tool.label(),
             Art::Undo => "撤销",
             Art::LongShot => "长截图",
+            Art::SessionKeep => "复制",
             Art::Pin => "钉图",
             Art::Save => "保存",
             Art::Copy => "复制",
@@ -414,6 +437,7 @@ impl Art {
             Art::Tool(Tool::Text) => icons::icon(glyph::TEXT, size, color),
             Art::Undo => icons::icon(glyph::REVOKE, size, color),
             Art::LongShot => icons::icon(glyph::LONG_SHOT, size, color),
+            Art::SessionKeep => icons::icon(glyph::COPY, size, color),
             Art::Pin => icons::icon(glyph::PIN, size, color),
             Art::Save => icons::icon(glyph::SAVE, size, color),
             Art::Copy => icons::icon(glyph::COPY, size, color),
@@ -608,53 +632,141 @@ impl Overlay {
     }
 
     /// How thick the frame is drawn, in logical pixels.
-    ///
-    /// It sits on the *outside* of the region, so it costs the shot nothing, and
-    /// it is drawn only as thick as it needs to be to be seen at a glance.
     fn frame_thickness(&self) -> f32 {
-        if self.frame_locked { 3.0 } else { 4.0 }
+        FRAME_THICKNESS
+    }
+
+    /// Where the session's own toolbar sits, in logical pixels.
+    ///
+    /// The same place the framing toolbar uses, so the buttons are where the
+    /// pointer already is: under the region's right edge, or above it when there
+    /// is no room below.
+    fn session_toolbar_rect(&self) -> Option<Rect> {
+        let selection = self.selection?;
+        let (view_w, view_h) = self.view_size();
+        let (width, height) = SESSION_TOOLBAR_SIZE;
+        let below = selection.bottom() + 8.0;
+        let top = if below + height <= view_h {
+            below
+        } else {
+            (selection.y - height - 8.0).max(0.0)
+        };
+        let left = (selection.right() - width).clamp(0.0, (view_w - width).max(0.0));
+        Some(Rect::new(left, top, width, height))
     }
 
     /// The four bands the frame occupies, in the window's client coordinates.
     ///
     /// They are drawn in logical pixels but a window region is in physical ones,
     /// hence the map — which is exactly the ratio between the two.
+    ///
+    /// The outline sits [`FRAME_GAP`] away from the region rather than against
+    /// it, which is what keeps it visible: see [`Self::apply_frame_region`].
     fn frame_bands(&self) -> Vec<(i32, i32, i32, i32)> {
         let Some(selection) = self.selection else {
             return Vec::new();
         };
-        let thickness = self.frame_thickness();
         let (map_x, map_y) = self.map;
-        let (x, y, w, h, t) = (
-            selection.x * map_x,
-            selection.y * map_y,
-            selection.w * map_x,
-            selection.h * map_y,
-            thickness * map_x,
-        );
-        let (x, y, w, h) = (x.round(), y.round(), w.round(), h.round());
-        let t = t.round().max(1.0) as i32;
-        let (x, y, w, h) = (x as i32, y as i32, w as i32, h as i32);
+        let t = (self.frame_thickness() * map_x).round().max(1.0) as i32;
+        // The outline's own rectangle: the region grown by the gap.
+        let x = ((selection.x - FRAME_GAP) * map_x).round() as i32;
+        let y = ((selection.y - FRAME_GAP) * map_y).round() as i32;
+        let w = ((selection.w + FRAME_GAP * 2.0) * map_x).round() as i32;
+        let h = ((selection.h + FRAME_GAP * 2.0) * map_y).round() as i32;
         vec![
             (x - t, y - t, w + t * 2, t),
             (x - t, y + h, w + t * 2, t),
-            (x - t, y, t, h),
-            (x + w, y, t, h),
+            (x - t, y - t, t, h + t * 2),
+            (x + w, y - t, t, h + t * 2),
         ]
     }
 
-    /// Hands the window only the frame, and gives up everything else.
+    /// Hands the window only the frame and the session's toolbar, and gives up
+    /// everything else.
     ///
     /// A window's region is what the mouse can see of it, so this is what lets
-    /// the desktop — and the taskbar, and any other window — be clicked while
-    /// the frame stays on screen.
+    /// the desktop — and the taskbar, and any other window — be clicked while the
+    /// frame stays on screen. The toolbar has to be in here too, or its own
+    /// buttons would be unclickable for the same reason.
     fn apply_frame_region(&self) {
-        let bands = if self.frame_only {
+        let mut rects = if self.frame_only {
             self.frame_bands()
         } else {
             Vec::new()
         };
-        win_util::set_window_region(app::OVERLAY_TITLE, &bands);
+        if self.frame_only {
+            // A couple of pixels of slack around each band, so the region cannot
+            // clip the frame it is drawn around.
+            let (map_x, map_y) = self.map;
+            let pad_x = (REGION_SLACK * map_x).round() as i32;
+            let pad_y = (REGION_SLACK * map_y).round() as i32;
+            for rect in &mut rects {
+                let (x, y, w, h) = *rect;
+                *rect = (x - pad_x, y - pad_y, w + pad_x * 2, h + pad_y * 2);
+            }
+            if let Some(toolbar) = self.session_toolbar_rect() {
+                rects.push((
+                    (toolbar.x * map_x).round() as i32,
+                    (toolbar.y * map_y).round() as i32,
+                    (toolbar.w * map_x).round().max(1.0) as i32,
+                    (toolbar.h * map_y).round().max(1.0) as i32,
+                ));
+            }
+        }
+        win_util::set_window_region(app::OVERLAY_TITLE, &rects);
+    }
+
+    /// The two buttons a session keeps.
+    ///
+    /// Everything else — the tools, the colours, the finishing buttons — would
+    /// either change a region that is already being captured or end the session
+    /// in a way that has no meaning while it is still collecting. What is left is
+    /// the pair the user needs: keep what has been stitched, or throw it away.
+    fn session_toolbar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let rect = self.session_toolbar_rect()?;
+        let button = |art: Art, action: Action, cx: &mut Context<Self>| -> AnyElement {
+            div()
+                .id(art.id())
+                .flex()
+                .items_center()
+                .justify_center()
+                .w(px(28.0))
+                .h(px(24.0))
+                .rounded(px(4.0))
+                .cursor_pointer()
+                .hover(|style| style.bg(rgb(0x3C3C3C)))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _event, window, cx| {
+                        this.apply(action, window, cx);
+                        cx.stop_propagation();
+                    }),
+                )
+                .child(art.element(16.0, rgb(0xD8D8D8)))
+                .into_any_element()
+        };
+        Some(
+            div()
+                .id("xshot-session-toolbar")
+                .absolute()
+                .left(px(rect.x))
+                .top(px(rect.y))
+                .w(px(rect.w))
+                .h(px(rect.h))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(4.0))
+                .px(px(6.0))
+                .rounded(px(7.0))
+                .bg(rgba(0x1E1E_1EF2))
+                .border_1()
+                .border_color(rgba(0xFFFF_FF26))
+                .shadow_lg()
+                .child(button(Art::SessionKeep, Action::SessionKeep, cx))
+                .child(button(Art::Cancel, Action::SessionDiscard, cx))
+                .into_any_element(),
+        )
     }
 
     /// Starts dragging the frame to somewhere else on screen.
@@ -721,7 +833,9 @@ impl Overlay {
     ///
     /// It sits entirely *outside* the region: the region is exactly what gets
     /// captured, so a border drawn on its edge — the way the selection outline
-    /// is while framing — would appear in every frame of the result.
+    /// is while framing — would appear in every frame of the result. It is also
+    /// held [`FRAME_GAP`] away from the region, which is where the window's own
+    /// region stops.
     fn session_frame(&self) -> Option<AnyElement> {
         let selection = self.selection?;
         let thickness = self.frame_thickness();
@@ -736,7 +850,10 @@ impl Overlay {
                 .bg(accent)
                 .into_any_element()
         };
-        let (x, y, w, h) = (selection.x, selection.y, selection.w, selection.h);
+        let x = selection.x - FRAME_GAP;
+        let y = selection.y - FRAME_GAP;
+        let w = selection.w + FRAME_GAP * 2.0;
+        let h = selection.h + FRAME_GAP * 2.0;
         Some(
             div()
                 .absolute()
@@ -744,10 +861,10 @@ impl Overlay {
                 .top_0()
                 .w_full()
                 .h_full()
+                .child(edge(x - thickness, y - thickness, thickness, h + thickness * 2.0))
+                .child(edge(x + w, y - thickness, thickness, h + thickness * 2.0))
                 .child(edge(x - thickness, y - thickness, w + thickness * 2.0, thickness))
                 .child(edge(x - thickness, y + h, w + thickness * 2.0, thickness))
-                .child(edge(x - thickness, y, thickness, h))
-                .child(edge(x + w, y, thickness, h))
                 .into_any_element(),
         )
     }
@@ -849,8 +966,7 @@ impl Overlay {
 
         let Some(selection) = self.selection else {
             // Nothing was selected: treat the gesture as "dismiss".
-            app::state_mut(cx).overlay = None;
-            window.remove_window();
+            self.cancel(window, cx);
             return;
         };
 
@@ -893,11 +1009,26 @@ impl Overlay {
             }
         }
 
+        // Same story as `cancel`: 复制 and 钉图 act on the press, so the release
+        // belongs to a window that is about to disappear.
+        tray::swallow_next_button_up("finish");
+        win_util::release_capture();
+        app::restore_foreground(cx);
         app::state_mut(cx).overlay = None;
         window.remove_window();
     }
 
     fn cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // The click that got here is still held down; its release has to be
+        // eaten, or it lands on whatever window is behind and counts as a click
+        // there — which is how a right click meant to cancel a screenshot ends
+        // up opening the context menu of the window behind it.
+        tray::swallow_next_button_up("cancel");
+        // GPUI took the capture on that press, and the release it needs is the
+        // one we just arranged to eat. Hand the capture back here, or the next
+        // click anywhere lands on a window that no longer exists.
+        win_util::release_capture();
+        app::restore_foreground(cx);
         app::state_mut(cx).overlay = None;
         window.remove_window();
     }
@@ -916,6 +1047,11 @@ impl Overlay {
                 self.shapes.pop();
             }
             Action::LongShot => self.start_session(cx, Session::Scrolling),
+            // Both of these act on the press, and the session's worker picks the
+            // answer up on its next tick — it owns the rows, so it is the one
+            // that can hand them over or drop them.
+            Action::SessionKeep => crate::capture::finish_with(crate::capture::Ending::Copy),
+            Action::SessionDiscard => crate::capture::finish_with(crate::capture::Ending::Discard),
             Action::Copy => self.finish(Finish::Copy, window, cx),
             Action::Save => self.finish(Finish::Save, window, cx),
             Action::Pin => self.finish(Finish::Pin, window, cx),
@@ -2951,6 +3087,7 @@ impl Render for Overlay {
         if self.frame_only {
             return root
                 .children(self.session_frame())
+                .children(self.session_toolbar(cx))
                 .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
                 .on_mouse_move(cx.listener(Self::on_mouse_move))
                 .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up));
@@ -3250,7 +3387,7 @@ fn resize(original: Rect, handle: Handle, position: Pt, view_w: f32, view_h: f32
 }
 
 /// Tessellates one annotation into a GPUI path.
-fn shape_path(shape: &Shape) -> Option<(Path<Pixels>, u32)> {
+pub(crate) fn shape_path(shape: &Shape) -> Option<(Path<Pixels>, u32)> {
     match shape {
         Shape::Rect { a, b, color, width } => {
             let mut builder = PathBuilder::stroke(px(*width));
@@ -3321,7 +3458,7 @@ fn shape_path(shape: &Shape) -> Option<(Path<Pixels>, u32)> {
 }
 
 /// The two primitives an arrow is made of: a stroked shaft and a solid head.
-fn arrow_paths(a: Pt, b: Pt, width: f32) -> Option<(Path<Pixels>, Path<Pixels>)> {
+pub(crate) fn arrow_paths(a: Pt, b: Pt, width: f32) -> Option<(Path<Pixels>, Path<Pixels>)> {
     let dx = b.x - a.x;
     let dy = b.y - a.y;
     let length = (dx * dx + dy * dy).sqrt();
@@ -3374,3 +3511,6 @@ fn utf8_index_for_utf16(text: &str, target: usize) -> usize {
 fn utf16_index_for_utf8(text: &str, target: usize) -> usize {
     utf16_len_upto(text, target.min(text.len()))
 }
+
+
+

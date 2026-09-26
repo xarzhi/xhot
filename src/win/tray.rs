@@ -11,7 +11,7 @@
 //! continue to whatever is underneath. Nothing the user does in another program
 //! is stolen.
 
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use async_channel::Sender;
@@ -78,6 +78,15 @@ static HOTKEY_CAPTURE: AtomicU32 = AtomicU32::new(0);
 static HOTKEY_RESTORE: AtomicU32 = AtomicU32::new(0);
 static CTRL_DRAG: AtomicBool = AtomicBool::new(false);
 static DRAG_START: Mutex<Option<(i32, i32)>> = Mutex::new(None);
+/// Set when a click closed one of our windows, so the release that follows is
+/// eaten instead of reaching the window underneath. See
+/// [`swallow_next_button_up`].
+static SWALLOW_BUTTON_UP: AtomicBool = AtomicBool::new(false);
+/// When that claim was armed, so a stale one cannot eat a later release.
+static SWALLOW_ARMED_AT: AtomicU64 = AtomicU64::new(0);
+/// How long a claim stays valid. The release it is meant for arrives within a
+/// few milliseconds of the press that closed the window.
+const SWALLOW_WINDOW_MS: u64 = 400;
 
 fn pack(hotkey: Option<Hotkey>) -> u32 {
     match hotkey {
@@ -276,6 +285,70 @@ unsafe fn apply_hotkeys(hwnd: HWND) {
     }
 }
 
+/// Eats the next mouse-button release.
+///
+/// Called when a click closes one of our windows: the release that follows would
+/// otherwise land on the window underneath and be read as a click there — which
+/// is how a right click meant to cancel a screenshot ends up opening the context
+/// menu of whatever was behind it.
+///
+/// Only armed while a button is actually held down. The same windows also close
+/// on `Esc` and on Enter, and those gestures leave no release behind — arming the
+/// claim anyway means it eats the next click's release, in whatever program the
+/// user clicks next. That program is then stuck with a button it thinks is still
+/// pressed: left clicks do nothing until a right click resets it.
+///
+/// `caller` only ever reaches the log, and the log only records the rare events:
+/// arming, eating, expiring. If a click ever goes missing, that file says which
+/// gesture left the claim behind.
+pub fn swallow_next_button_up(caller: &str) {
+    if !any_button_down() {
+        mouse_log(&format!("{caller}: no button held, claim not armed"));
+        return;
+    }
+    SWALLOW_ARMED_AT.store(now_millis(), Ordering::SeqCst);
+    SWALLOW_BUTTON_UP.store(true, Ordering::SeqCst);
+    mouse_log(&format!("{caller}: armed for the release of this press"));
+}
+
+/// Appends one line to `%TEMP%\xshot-mouse.log`.
+///
+/// Called a handful of times in a session at most, so it opens the file each
+/// time rather than holding a handle open.
+pub(crate) fn mouse_log(message: &str) {
+    use std::io::Write;
+    let path = std::env::temp_dir().join("xshot-mouse.log");
+    let minutes = now_millis() / 60_000;
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(
+            file,
+            "[{:>4}m{:02}s] {message}",
+            minutes,
+            (now_millis() / 1000) % 60
+        );
+    }
+}
+
+/// Whether a mouse button is being held right now.
+fn any_button_down() -> bool {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        GetAsyncKeyState, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON,
+    };
+    unsafe {
+        [VK_LBUTTON, VK_RBUTTON, VK_MBUTTON]
+            .into_iter()
+            .any(|key| GetAsyncKeyState(key.0 as i32) < 0)
+    }
+}
+
+/// Milliseconds since the process started, for the swallow's short lifetime.
+fn now_millis() -> u64 {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
 /// Watches for Ctrl + left-drag and reports the dragged rectangle.
 ///
 /// The hook never consumes the event, so the drag still reaches whatever window
@@ -294,6 +367,41 @@ unsafe fn install_mouse_hook(hinstance: HINSTANCE) {
 
 unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
+        if code >= 0 {
+            let message = wparam.0 as u32;
+
+            // A press always means the previous click finished: any release we
+            // were still holding a claim on was missed, and swallowing a later
+            // one would eat a real click.
+            if matches!(message, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN) {
+                SWALLOW_BUTTON_UP.store(false, Ordering::SeqCst);
+            }
+
+            // Our windows close on the button *down* — right click cancels a
+            // screenshot, and the toolbar's 复制/钉图 act on the press too — so
+            // the matching release arrives when the window is already gone.
+            // Windows then hands it to whatever is behind, which is enough for
+            // that window to treat the click as its own and pop a context menu.
+            // Eating that one release here is the only place early enough to
+            // stop it.
+            //
+            // Only a release that follows promptly counts. A claim left lying
+            // around eats some *later* click's release, which belongs to another
+            // program and leaves it believing the button is still held — one
+            // left click then does nothing until a right click resets it.
+            if matches!(message, WM_LBUTTONUP | WM_RBUTTONUP | WM_MBUTTONUP)
+                && SWALLOW_BUTTON_UP.swap(false, Ordering::SeqCst)
+            {
+                let armed_at = SWALLOW_ARMED_AT.load(Ordering::SeqCst);
+                let age = now_millis().saturating_sub(armed_at);
+                if age < SWALLOW_WINDOW_MS {
+                    mouse_log(&format!("ate the release ({age} ms after arming)"));
+                    return LRESULT(1);
+                }
+                mouse_log(&format!("claim was {age} ms old, release passed through"));
+            }
+        }
+
         if code >= 0 && CTRL_DRAG.load(Ordering::SeqCst) {
             let info = &*(lparam.0 as *const MSLLHOOKSTRUCT);
             match wparam.0 as u32 {

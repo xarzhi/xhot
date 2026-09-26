@@ -14,13 +14,32 @@ use std::time::{Duration, Instant};
 
 use gpui_kit::*;
 
-use crate::annot::Pt;
+use crate::annot::{PALETTE, Pt, Shape, Tool, WIDTHS};
 use crate::app;
+use crate::ui::icons::glyph;
 use crate::ui::pin_menu::{MenuChoice, PinMenu};
 use crate::ui::theme::{RADIUS_CARD, TEXT_BODY, TEXT_CAPTION, Theme};
 use crate::win::frame::Dib;
 use crate::win::ocr::{self, OcrLine, OcrWord};
-use crate::win::{clip, util as win_util};
+use crate::win::{clip, paint, util as win_util};
+
+/// Height of the annotation toolbar, in logical pixels.
+const EDIT_BAR_HEIGHT: f32 = 44.0;
+
+/// The icon for one of the pin's drawing tools.
+fn icon_for(tool: Tool, color: Rgba) -> AnyElement {
+    use crate::ui::icons::{self, glyph};
+    let art = match tool {
+        Tool::Rect => glyph::RECT,
+        Tool::Ellipse => glyph::CIRCLE,
+        Tool::Arrow => glyph::ARROW,
+        Tool::Pen => glyph::PEN,
+        Tool::Mosaic => glyph::MOSAIC,
+        Tool::Eraser => glyph::RUBBER,
+        Tool::Text => glyph::TEXT,
+    };
+    icons::icon(art, 17.0, color)
+}
 
 const TOAST_LIFETIME: Duration = Duration::from_millis(1800);
 const MIN_ZOOM: f32 = 0.1;
@@ -56,6 +75,9 @@ pub struct Pin {
     zoom: f32,
     scale: f32,
     shadow: bool,
+    /// Corner radius the shot was cut to, in logical pixels. Kept here so the
+    /// annotations are rounded with the image when the pin is copied or saved.
+    radius: f32,
     theme: Theme,
     focus: FocusHandle,
 
@@ -77,6 +99,21 @@ pub struct Pin {
     /// Set when the menu asked for the pin to go away; applied on the next
     /// frame, because a window can only be removed while it is being drawn.
     close_requested: bool,
+
+    /// Whether the pin is being annotated, which is what puts the toolbar under
+    /// it and turns presses over the image into drawing.
+    editing: bool,
+    tool: Option<Tool>,
+    color: u32,
+    width: f32,
+    /// Annotations, in the pin's own logical coordinates — the same space the
+    /// pointer is reported in, so what is drawn is what is seen. They are scaled
+    /// to pixels when the pin is copied or saved.
+    shapes: Vec<Shape>,
+    /// The shape being dragged out right now.
+    draft: Option<Shape>,
+    /// Where the current stroke started, in pin coordinates.
+    stroke_from: Option<Pt>,
 }
 
 impl Pin {
@@ -125,6 +162,7 @@ impl Pin {
             zoom,
             scale,
             shadow,
+            radius: app::state(cx).config.corner_radius.clamp(0.0, 96.0),
             theme,
             focus: cx.focus_handle(),
             lines: Vec::new(),
@@ -137,6 +175,13 @@ impl Pin {
             menu: None,
             menu_entity: None,
             close_requested: false,
+            editing: false,
+            tool: None,
+            color: PALETTE[0],
+            width: WIDTHS[1],
+            shapes: Vec::new(),
+            draft: None,
+            stroke_from: None,
         }
     }
 
@@ -243,7 +288,8 @@ impl Pin {
     }
 
     fn copy_image(&mut self, cx: &mut Context<Self>) {
-        match clip::copy_image(&self.pixels) {
+        let outcome = self.annotated().and_then(|shot| clip::copy_image(&shot));
+        match outcome {
             Ok(()) => self.toast = Some(("已复制图像".into(), Instant::now())),
             Err(error) => {
                 eprintln!("xshot: clipboard write failed: {error:#}");
@@ -256,7 +302,10 @@ impl Pin {
     fn save_image(&mut self, cx: &mut Context<Self>) {
         let directory = app::state(cx).config.save_dir.clone();
         let name = format!("xshot_{}.png", chrono::Local::now().format("%Y%m%d%H%M%S"));
-        match self.pixels.save_png(&directory.join(name)) {
+        let outcome = self
+            .annotated()
+            .and_then(|shot| shot.save_png(&directory.join(name)));
+        match outcome {
             Ok(()) => self.toast = Some((format!("已保存到 {}", directory.display()), Instant::now())),
             Err(error) => {
                 eprintln!("xshot: save failed: {error:#}");
@@ -264,6 +313,276 @@ impl Pin {
             }
         }
         cx.notify();
+    }
+
+    /// The shot as it stands: the image, with whatever has been drawn on it.
+    ///
+    /// The annotations live in the pin's logical space, which is the space the
+    /// pointer is reported in, so they are scaled to the image's own pixels here
+    /// — the one place that conversion has to happen.
+    fn annotated(&self) -> anyhow::Result<Dib> {
+        let width = self.pixels.width;
+        let height = self.pixels.height;
+        let mut shot = self.pixels.crop(0, 0, width, height)?;
+        if !self.shapes.is_empty() {
+            let factor = self.image_scale();
+            paint::draw_shapes(&mut shot, &self.shapes, (factor, factor), (0.0, 0.0));
+            // The image itself is already rounded; drawing on it can put ink back
+            // into the corners the file is supposed to have cut away.
+            let radius = (self.radius * self.scale / self.zoom.max(0.01)).round() as i32;
+            paint::round_corners(&mut shot, radius);
+        }
+        Ok(shot)
+    }
+
+    // -- annotating --------------------------------------------------------
+
+    /// Turns the annotation toolbar on or off, and makes room for it.
+    ///
+    /// The toolbar lives in the pin's own window, below the image: a second
+    /// window would have to be kept in step with this one as it is dragged,
+    /// zoomed and closed, and a pin is small enough that the extra height is
+    /// nothing.
+    fn toggle_edit(&mut self, cx: &mut Context<Self>) {
+        self.editing = !self.editing;
+        if !self.editing {
+            self.tool = None;
+            self.draft = None;
+            self.stroke_from = None;
+        }
+        self.fit_window();
+        self.toast = Some((
+            if self.editing { "编辑：选一个工具开始画" } else { "已退出编辑" }.into(),
+            Instant::now(),
+        ));
+        cx.notify();
+    }
+
+    /// Resizes the window to hold the image, plus the toolbar while editing.
+    fn fit_window(&self) {
+        let scale = self.scale.max(0.1);
+        let (Some((x, y)), true) = (win_util::client_origin(&self.title), true) else {
+            return;
+        };
+        let width = (self.pixels.width as f32 * self.zoom).round() as i32;
+        let mut height = (self.pixels.height as f32 * self.zoom).round() as i32;
+        if self.editing {
+            height += (EDIT_BAR_HEIGHT * scale).round() as i32;
+        }
+        win_util::place_client_exact(&self.title, x, y, width, height);
+    }
+
+    /// Starts a stroke, if a tool is armed and the press was on the image.
+    fn begin_stroke(&mut self, position: Point<Pixels>) -> bool {
+        let Some(tool) = self.tool else {
+            return false;
+        };
+        let at = Pt::new(position.x.as_f32(), position.y.as_f32());
+        self.stroke_from = Some(at);
+        self.draft = Some(match tool {
+            Tool::Rect => Shape::Rect { a: at, b: at, color: self.color, width: self.width },
+            Tool::Ellipse => Shape::Ellipse { a: at, b: at, color: self.color, width: self.width },
+            Tool::Arrow => Shape::Arrow { a: at, b: at, color: self.color, width: self.width },
+            Tool::Pen => Shape::Pen { points: vec![at], color: self.color, width: self.width },
+            // The rest are the capture overlay's: a mosaic is cut from the frozen
+            // screen, and the eraser and text tool have their own gestures.
+            _ => return false,
+        });
+        true
+    }
+
+    fn continue_stroke(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let at = Pt::new(position.x.as_f32(), position.y.as_f32());
+        match self.draft.as_mut() {
+            Some(Shape::Rect { b, .. })
+            | Some(Shape::Ellipse { b, .. })
+            | Some(Shape::Arrow { b, .. }) => *b = at,
+            Some(Shape::Pen { points, .. }) => {
+                if points
+                    .last()
+                    .map(|last| (last.x - at.x).abs() + (last.y - at.y).abs() > 1.5)
+                    .unwrap_or(true)
+                {
+                    points.push(at);
+                }
+            }
+            _ => return,
+        }
+        cx.notify();
+    }
+
+    fn end_stroke(&mut self, cx: &mut Context<Self>) {
+        self.stroke_from = None;
+        let Some(draft) = self.draft.take() else {
+            return;
+        };
+        // A click with no drag is not a shape: it would leave a dot the user
+        // cannot see or remove.
+        let visible = match &draft {
+            Shape::Pen { points, .. } => points.len() > 1,
+            Shape::Rect { a, b, .. } | Shape::Ellipse { a, b, .. } | Shape::Arrow { a, b, .. } => {
+                (a.x - b.x).abs() + (a.y - b.y).abs() > 2.0
+            }
+            _ => false,
+        };
+        if visible {
+            self.shapes.push(draft);
+        }
+        cx.notify();
+    }
+
+    /// The annotation toolbar: the tools the pin can draw with, their colours and
+    /// widths, and the way out.
+    fn edit_bar(&self, theme: Theme, cx: &mut Context<Self>) -> AnyElement {
+        let mut row = div()
+            .id("pin-edit-bar")
+            .absolute()
+            .left(px(0.0))
+            .bottom(px(0.0))
+            .w_full()
+            .h(px(EDIT_BAR_HEIGHT))
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_center()
+            .gap(px(4.0))
+            .child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .top_0()
+                    .w_full()
+                    .h_full()
+                    .bg(theme.window)
+                    .border_1()
+                    .border_color(theme.stroke_strong),
+            );
+
+        for tool in [Tool::Rect, Tool::Ellipse, Tool::Arrow, Tool::Pen] {
+            let active = self.tool == Some(tool);
+            row = row.child(
+                div()
+                    .id(tool.label())
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(px(30.0))
+                    .h(px(26.0))
+                    .rounded(px(4.0))
+                    .cursor_pointer()
+                    .bg(if active { rgb(0x1E88E5) } else { rgba(0x0000_0000) })
+                    .hover(move |style| style.bg(theme.card_hover))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |pin, _event, _window, cx| {
+                            pin.tool = (pin.tool != Some(tool)).then_some(tool);
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    )
+                    .child(icon_for(tool, if active { rgb(0xFFFFFF) } else { theme.text })),
+            );
+        }
+
+        row = row.child(div().w(px(1.0)).h(px(18.0)).bg(theme.stroke));
+        for value in PALETTE {
+            let active = value == self.color;
+            row = row.child(
+                div()
+                    .id(("pin-swatch", value))
+                    .w(px(16.0))
+                    .h(px(16.0))
+                    .rounded(px(8.0))
+                    .bg(rgb(value))
+                    .border_1()
+                    .border_color(if active { rgb(0xFFFFFF) } else { rgba(0xFFFF_FF33) })
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |pin, _event, _window, cx| {
+                            pin.color = value;
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    ),
+            );
+        }
+
+        row = row.child(div().w(px(1.0)).h(px(18.0)).bg(theme.stroke));
+        for value in WIDTHS {
+            let active = (value - self.width).abs() < 0.01;
+            let (w, h) = ((value / 2.5).clamp(4.0, 16.0), (value / 5.0).clamp(2.0, 6.0));
+            row = row.child(
+                div()
+                    .id(("pin-width", (value * 10.0) as u32))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(px(24.0))
+                    .h(px(22.0))
+                    .rounded(px(4.0))
+                    .cursor_pointer()
+                    .bg(if active { rgb(0x1E88E5) } else { rgba(0x0000_0000) })
+                    .hover(move |style| style.bg(theme.card_hover))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |pin, _event, _window, cx| {
+                            pin.width = value;
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    )
+                    .child(div().w(px(w)).h(px(h)).rounded(px(h / 2.0)).bg(theme.text)),
+            );
+        }
+
+        row = row.child(div().w(px(1.0)).h(px(18.0)).bg(theme.stroke));
+        row = row
+            .child(
+                div()
+                    .id("pin-edit-undo")
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(px(30.0))
+                    .h(px(26.0))
+                    .rounded(px(4.0))
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(theme.card_hover))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|pin, _event, _window, cx| {
+                            pin.shapes.pop();
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    )
+                    .child(crate::ui::icons::icon(glyph::REVOKE, 16.0, theme.text)),
+            )
+            .child(
+                div()
+                    .id("pin-edit-done")
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .px(px(10.0))
+                    .h(px(26.0))
+                    .rounded(px(4.0))
+                    .bg(rgb(0x1E88E5))
+                    .cursor_pointer()
+                    .text_size(px(TEXT_BODY))
+                    .text_color(rgb(0xFFFFFF))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|pin, _event, _window, cx| {
+                            pin.toggle_edit(cx);
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .child("完成"),
+            );
+
+        row.into_any_element()
     }
 
     fn toggle_shadow(&mut self, cx: &mut Context<Self>) {
@@ -389,6 +708,7 @@ impl Pin {
                         self.copy_text(&joined, cx);
                     }
                 }
+                MenuChoice::Edit => self.toggle_edit(cx),
                 MenuChoice::ToggleShadow => self.toggle_shadow(cx),
                 MenuChoice::Save => self.save_image(cx),
                 MenuChoice::Close => {
@@ -448,6 +768,12 @@ impl Pin {
                 // The previous selection stays highlighted for a moment, but a
                 // new press always starts from scratch.
                 self.band = None;
+                // An armed tool draws instead of selecting text or moving the
+                // window: that is what the editor is for.
+                if self.editing && self.begin_stroke(event.position) {
+                    cx.notify();
+                    return;
+                }
                 if self.word_near(point).is_some() {
                     // On text: dragging selects it, exactly like any other text
                     // surface. A plain click picks the single word under the
@@ -477,6 +803,14 @@ impl Pin {
         // because the band was left in place so the highlight could stay
         // visible.
         let held = event.pressed_button == Some(MouseButton::Left);
+
+        // An armed tool owns the drag while the editor is open.
+        if self.stroke_from.is_some() {
+            if held {
+                self.continue_stroke(event.position, cx);
+            }
+            return;
+        }
 
         if held && self.band.is_some() {
             if let Some((from, _)) = self.band {
@@ -508,6 +842,10 @@ impl Pin {
     }
 
     fn on_mouse_up(&mut self, _event: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.stroke_from.is_some() {
+            self.end_stroke(cx);
+            return;
+        }
         // The release that follows a double-click belongs to the word that
         // double-click just selected: it must not be read as a click and drop
         // the highlight again.
@@ -543,11 +881,27 @@ impl Pin {
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
         if key == "escape" {
+            // Escape backs out one level, like everywhere else: the tool, then
+            // the editor, then the pin.
+            if self.editing {
+                if self.tool.take().is_some() {
+                    self.draft = None;
+                    cx.notify();
+                } else {
+                    self.toggle_edit(cx);
+                }
+                return;
+            }
             if self.band.take().is_some() {
                 cx.notify();
             } else {
                 window.remove_window();
             }
+            return;
+        }
+        if key == "z" && event.keystroke.modifiers.control && self.editing {
+            self.shapes.pop();
+            cx.notify();
             return;
         }
         if key == "c" && event.keystroke.modifiers.control {
@@ -559,8 +913,49 @@ impl Pin {
 
     // -- rendering ---------------------------------------------------------
 
-    fn highlights(&self, theme: Theme) -> Vec<AnyElement> {
-        let factor = 1.0 / self.image_scale();
+    /// The annotations, drawn in the pin's own logical space.
+    ///
+    /// The same painters the capture overlay uses, so a rectangle drawn here and
+    /// a rectangle drawn there are the same rectangle.
+    fn shapes_canvas(&self) -> Vec<AnyElement> {
+        if self.shapes.is_empty() && self.draft.is_none() {
+            return Vec::new();
+        }
+        let mut shapes = self.shapes.clone();
+        if let Some(draft) = &self.draft {
+            shapes.push(draft.clone());
+        }
+        vec![
+            canvas(
+                move |_bounds, _window, _cx| shapes,
+                move |_bounds, shapes, window, _cx| {
+                    for shape in &shapes {
+                        if let Shape::Arrow { a, b, color, width } = shape {
+                            if let Some((shaft, tip)) =
+                                crate::ui::overlay::arrow_paths(*a, *b, *width)
+                            {
+                                window.paint_path(shaft, rgb(*color));
+                                window.paint_path(tip, rgb(*color));
+                            }
+                            continue;
+                        }
+                        let Some((path, color)) = crate::ui::overlay::shape_path(shape) else {
+                            continue;
+                        };
+                        window.paint_path(path, rgb(color));
+                    }
+                },
+            )
+            .absolute()
+            .left_0()
+            .top_0()
+            .w_full()
+            .h_full()
+            .into_any_element(),
+        ]
+    }
+
+    fn highlights(&self, theme: Theme) -> Vec<AnyElement> {        let factor = 1.0 / self.image_scale();
         let mut elements = Vec::new();
 
         // Everything selected, word by word.
@@ -629,7 +1024,10 @@ impl Render for Pin {
         // pin draws the same shape rather than a square window around it. Zoom
         // scales the corners with everything else, which is what keeps them
         // matching; `scale` cancels out because the radius is logical here.
-        let radius = app::state(cx).config.corner_radius.clamp(0.0, 96.0) * self.zoom;
+        let radius = self.radius * self.zoom;
+        // While the toolbar is up the window is taller than the image, so the
+        // image is given its own height instead of filling the window.
+        let image_height = self.pixels.height as f32 * self.zoom / self.scale;
 
         let mut root = div()
             .id("xshot-pin")
@@ -651,11 +1049,16 @@ impl Render for Pin {
                     .left_0()
                     .top_0()
                     .w_full()
-                    .h_full()
+                    .h(px(image_height))
                     .rounded(px(radius))
                     .object_fit(ObjectFit::Fill),
             )
+            .children(self.shapes_canvas())
             .children(self.highlights(theme));
+
+        if self.editing {
+            root = root.child(self.edit_bar(theme, cx));
+        }
 
         if let Some(badge) = self.toast_badge(theme) {
             root = root.child(badge);

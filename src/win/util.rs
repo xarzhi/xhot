@@ -567,6 +567,14 @@ pub fn release_capture() {
 /// outside it do not exist as far as the mouse is concerned. That is the only
 /// way to keep a frame on screen while every click outside it still belongs to
 /// the application underneath. An empty list gives the whole window back.
+///
+/// The rectangles are *client* coordinates, which is what the callers think in;
+/// a region is in *window* coordinates, and the difference is the window's
+/// invisible frame — a handful of pixels even on a borderless window. Ignoring
+/// it shifts the whole region by that much, which a wide band survives and a
+/// thin one does not: a 4 px frame edge came out shifted clean off its own
+/// region and vanished, while the same edge along the top was wide enough to
+/// still be inside it.
 pub fn set_window_region(title: &str, rects: &[(i32, i32, i32, i32)]) -> bool {
     use windows::Win32::Graphics::Gdi::{
         CombineRgn, CreateRectRgn, DeleteObject, HGDIOBJ, RGN_OR, SetWindowRgn,
@@ -575,22 +583,34 @@ pub fn set_window_region(title: &str, rects: &[(i32, i32, i32, i32)]) -> bool {
     let Some(hwnd) = find_window(title) else {
         return false;
     };
+    let (inset_x, inset_y) = client_inset(hwnd);
     unsafe {
         if rects.is_empty() {
             // `None` means "no region": the window is its whole rectangle again.
             return SetWindowRgn(hwnd, None, true) != 0;
         }
-        let combined = CreateRectRgn(0, 0, 0, 0);
+        // Each rectangle is combined into a *fresh* accumulator rather than into
+        // the one being read: the destination may be one of the sources, but a
+        // region assembled that way is best not trusted with a window's shape.
+        let mut combined = CreateRectRgn(0, 0, 0, 0);
         if combined.is_invalid() {
             return false;
         }
         for (x, y, w, h) in rects {
-            let part = CreateRectRgn(*x, *y, x + w, y + h);
+            let (left, top) = (x + inset_x, y + inset_y);
+            let part = CreateRectRgn(left, top, left + w, top + h);
             if part.is_invalid() {
                 continue;
             }
-            let _ = CombineRgn(Some(combined), Some(combined), Some(part), RGN_OR);
+            let next = CreateRectRgn(0, 0, 0, 0);
+            if next.is_invalid() {
+                let _ = DeleteObject(HGDIOBJ(part.0));
+                continue;
+            }
+            let _ = CombineRgn(Some(next), Some(combined), Some(part), RGN_OR);
+            let _ = DeleteObject(HGDIOBJ(combined.0));
             let _ = DeleteObject(HGDIOBJ(part.0));
+            combined = next;
         }
         // The system takes ownership of the region once it has been set; it must
         // only be deleted when the call failed.
@@ -600,6 +620,22 @@ pub fn set_window_region(title: &str, rects: &[(i32, i32, i32, i32)]) -> bool {
             let _ = DeleteObject(HGDIOBJ(combined.0));
             false
         }
+    }
+}
+
+/// How far a window's client area starts inside its window rectangle.
+///
+/// Even a borderless window has a few pixels of invisible frame, and that is the
+/// difference between the two coordinate spaces Windows uses.
+fn client_inset(hwnd: HWND) -> (i32, i32) {
+    unsafe {
+        let mut window_rect = RECT::default();
+        let mut origin = POINT { x: 0, y: 0 };
+        if GetWindowRect(hwnd, &mut window_rect).is_err() || !ClientToScreen(hwnd, &mut origin).as_bool()
+        {
+            return (0, 0);
+        }
+        (origin.x - window_rect.left, origin.y - window_rect.top)
     }
 }
 
