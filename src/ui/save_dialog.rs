@@ -465,10 +465,12 @@ pub fn open(cx: &mut App, pixels: Dib) {
 /// Closes the save window if it is open.
 pub fn close(cx: &mut App) {
     if let Some(handle) = app::state_mut(cx).save_dialog.take() {
-        // `remove_window` only sets a flag that a later frame drains, and after
-        // a save the window has to be gone *now* — a dialog that lingers even
-        // for a frame reads as "the save did not work".
-        win_util::hide_window(app::SAVE_TITLE);
-        let _ = handle.update(cx, |_, window, _| window.remove_window());
+        // After a save the window has to be gone *now*: a dialog that lingers
+        // even for a frame reads as "the save did not work", and while it is
+        // there it still takes every click that lands on it. See
+        // [`app::retire_window`].
+        let _ = handle.update(cx, |_, window, _| {
+            app::retire_window(app::SAVE_TITLE, window);
+        });
     }
 }

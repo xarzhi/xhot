@@ -685,13 +685,13 @@ pub fn reposition(cx: &mut App, region: (i32, i32, i32, i32)) {
 /// Closes the toolbar if it is open.
 pub fn close(cx: &mut App) {
     if let Some(handle) = app::state_mut(cx).record_bar.take() {
-        // Hide through Win32 first: `remove_window` only sets a flag that a
-        // later frame drains, and a toolbar left on screen for even one frame
-        // after a recording ends would land in the next screenshot. Hiding also
-        // hands back the mouse capture, which this window took when its button
-        // was pressed.
-        win_util::hide_window(app::RECORD_BAR_TITLE);
-        let _ = handle.update(cx, |_, window, _| window.remove_window());
+        // Gone now rather than on the toolkit's next frame: a toolbar left on
+        // screen for even one frame after a recording ends would land in the
+        // next screenshot, and while it is there it still takes every click that
+        // lands on it. See [`app::retire_window`].
+        let _ = handle.update(cx, |_, window, _| {
+            app::retire_window(app::RECORD_BAR_TITLE, window);
+        });
     }
 }
 

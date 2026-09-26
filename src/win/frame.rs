@@ -306,7 +306,7 @@ mod tests {
         let screen = crate::win::util::virtual_screen();
         let (w, h) = (screen.w, screen.h);
 
-        let mut times = |label: &str, mut run: Box<dyn FnMut() + '_>| {
+        let times = |label: &str, mut run: Box<dyn FnMut() + '_>| {
             // One warm-up, then the best of three: the first BitBlt after the
             // desktop has been idle pays for the compositor waking up.
             run();
@@ -320,7 +320,7 @@ mod tests {
         };
 
         times("whole screen, CAPTUREBLT", Box::new(|| {
-            let mut dib = Dib::new(w, h).unwrap();
+            let dib = Dib::new(w, h).unwrap();
             unsafe {
                 let dc = GetDC(None);
                 let _ = BitBlt(
@@ -340,7 +340,7 @@ mod tests {
         }));
 
         times("whole screen, plain SRCCOPY", Box::new(|| {
-            let mut dib = Dib::new(w, h).unwrap();
+            let dib = Dib::new(w, h).unwrap();
             unsafe {
                 let dc = GetDC(None);
                 let _ = BitBlt(dib.hdc, 0, 0, w, h, Some(dc), screen.x, screen.y, SRCCOPY);
@@ -562,7 +562,7 @@ mod tests {
         }
         // Both together, so the desktop has as little chance to change between
         // them as possible.
-        let mut gdi = Dib::new(screen.w, screen.h).unwrap();
+        let gdi = Dib::new(screen.w, screen.h).unwrap();
         unsafe {
             let dc = GetDC(None);
             let _ = BitBlt(

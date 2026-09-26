@@ -21,7 +21,7 @@ use crate::ui::pin_menu::{MenuChoice, PinMenu};
 use crate::ui::theme::{RADIUS_CARD, TEXT_BODY, TEXT_CAPTION, Theme};
 use crate::win::frame::Dib;
 use crate::win::ocr::{self, OcrLine, OcrWord};
-use crate::win::{clip, paint, util as win_util};
+use crate::win::{clip, paint, tray, util as win_util};
 
 /// Height of the annotation toolbar, in logical pixels.
 const EDIT_BAR_HEIGHT: f32 = 44.0;
@@ -659,9 +659,27 @@ impl Pin {
 
     fn close_menu(&mut self, cx: &mut Context<Self>) {
         if let Some(handle) = self.menu.take() {
-            let _ = handle.update(cx, |_, window, _| window.remove_window());
+            let _ = handle.update(cx, |_, window, _| {
+                app::retire_window(MENU_TITLE, window);
+            });
         }
         self.menu_entity = None;
+    }
+
+    /// Closes the pin for good.
+    ///
+    /// Every close of this window is a press on the window itself — the ✕
+    /// button, or the second click of the copy-and-close double click — and the
+    /// release that follows belongs to a window that is going away. Left alone
+    /// it lands on whatever is behind and counts as a click there, and the
+    /// window itself has to be gone now rather than on the toolkit's next
+    /// frame: until then it is an invisible window taking every click that
+    /// lands on it. See [`crate::app::retire_window`].
+    fn close(&mut self, window: &mut Window) {
+        tray::swallow_next_button_up("pin close");
+        // GPUI took the capture on that press and will never see its release.
+        win_util::release_capture();
+        app::retire_window(&self.title, window);
     }
 
     /// Follows the menu until it is used or dismissed.
@@ -735,7 +753,7 @@ impl Pin {
 
     // -- input -------------------------------------------------------------
 
-    fn on_mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_mouse_down(&mut self, event: &MouseDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         if self.menu.is_some() {
             self.close_menu(cx);
             return;
@@ -761,8 +779,9 @@ impl Pin {
                         cx.notify();
                         return;
                     }
-                    self.copy_image(cx);
-                    window.remove_window();
+                    // The copy and the close both happen on the *release*: see
+                    // `on_mouse_up`, and `close` for why the window has to be
+                    // there when the button comes up.
                     return;
                 }
                 // The previous selection stays highlighted for a moment, but a
@@ -841,7 +860,7 @@ impl Pin {
         }
     }
 
-    fn on_mouse_up(&mut self, _event: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn on_mouse_up(&mut self, event: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
         if self.stroke_from.is_some() {
             self.end_stroke(cx);
             return;
@@ -851,6 +870,16 @@ impl Pin {
         // the highlight again.
         if self.keep_band {
             self.keep_band = false;
+            return;
+        }
+        // Past that branch the double click was not on text, which is the
+        // QQ-style "double click copies the shot and closes the pin". It happens
+        // on the release so that the release is spent here instead of landing on
+        // the window behind the pin. The press has already been seen (and
+        // deliberately ignored) by `on_mouse_down`.
+        if event.button == MouseButton::Left && event.click_count >= 2 {
+            self.copy_image(cx);
+            self.close(window);
             return;
         }
         if let Some((from, to)) = self.band {
@@ -895,7 +924,7 @@ impl Pin {
             if self.band.take().is_some() {
                 cx.notify();
             } else {
-                window.remove_window();
+                self.close(window);
             }
             return;
         }
@@ -1016,7 +1045,7 @@ impl Render for Pin {
         self.scale = window.scale_factor().max(0.1);
         if self.close_requested {
             self.close_requested = false;
-            window.remove_window();
+            self.close(window);
         }
         let theme = self.theme;
         let _ = &self.ocr_state;
@@ -1084,10 +1113,17 @@ impl Render for Pin {
                     .opacity(0.0)
                     .hover(|style| style.opacity(1.0))
                     .cursor_pointer()
-                    .on_mouse_down(MouseButton::Left, |_event, window, cx| {
+                    // The press stays here — it must not reach the pin and start
+                    // moving it — but the close happens on the *release*, so that
+                    // the release is spent here instead of landing on whatever is
+                    // behind the pin. See `close`.
+                    .on_mouse_down(MouseButton::Left, cx.listener(|_, _event, _, cx| {
                         cx.stop_propagation();
-                        window.remove_window();
-                    })
+                    }))
+                    .on_mouse_up(MouseButton::Left, cx.listener(|this, _event, window, cx| {
+                        cx.stop_propagation();
+                        this.close(window);
+                    }))
                     .child("✕"),
             )
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))

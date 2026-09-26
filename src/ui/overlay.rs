@@ -977,8 +977,7 @@ impl Overlay {
         let height = ((selection.h * map.1).round() as i32).clamp(1, self.source.height - origin_y);
 
         let Ok(mut output) = self.source.crop(origin_x, origin_y, width, height) else {
-            app::state_mut(cx).overlay = None;
-            window.remove_window();
+            self.end_session("finish: the crop failed", window, cx);
             return;
         };
         let offset = self.composite_offset((origin_x, origin_y));
@@ -1011,11 +1010,33 @@ impl Overlay {
 
         // Same story as `cancel`: 复制 and 钉图 act on the press, so the release
         // belongs to a window that is about to disappear.
-        tray::swallow_next_button_up("finish");
+        self.end_session("finish", window, cx);
+    }
+
+    /// Ends the capture: the release, the capture, the foreground, the window.
+    ///
+    /// Every close of this window goes through here, because every one of them
+    /// is triggered by a press on the window itself:
+    ///
+    /// * the press is still held, so its release would land on whatever is
+    ///   behind and count as a click there — a right click meant to cancel ends
+    ///   up opening the context menu of the window behind;
+    /// * GPUI took the mouse capture on that press, and only the matching
+    ///   release gives it back;
+    /// * the window itself must be gone the moment this returns. `remove_window`
+    ///   alone is not enough: it is a request the toolkit drains on a later
+    ///   frame, and this window is often the last one the app has. A full-screen
+    ///   window that is still there while showing nothing is what makes clicks
+    ///   do nothing anywhere until another click happens to land on it.
+    fn end_session(&mut self, caller: &str, window: &mut Window, cx: &mut Context<Self>) {
+        tray::swallow_next_button_up(caller);
+        // GPUI took the capture on that press, and the release it needs is the
+        // one we just arranged to eat. Hand the capture back here, or the next
+        // click anywhere lands on a window that no longer exists.
         win_util::release_capture();
         app::restore_foreground(cx);
         app::state_mut(cx).overlay = None;
-        window.remove_window();
+        app::retire_window(app::OVERLAY_TITLE, window);
     }
 
     fn cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1023,14 +1044,7 @@ impl Overlay {
         // eaten, or it lands on whatever window is behind and counts as a click
         // there — which is how a right click meant to cancel a screenshot ends
         // up opening the context menu of the window behind it.
-        tray::swallow_next_button_up("cancel");
-        // GPUI took the capture on that press, and the release it needs is the
-        // one we just arranged to eat. Hand the capture back here, or the next
-        // click anywhere lands on a window that no longer exists.
-        win_util::release_capture();
-        app::restore_foreground(cx);
-        app::state_mut(cx).overlay = None;
-        window.remove_window();
+        self.end_session("cancel", window, cx);
     }
 
     fn apply(&mut self, action: Action, window: &mut Window, cx: &mut Context<Self>) {
@@ -1087,39 +1101,16 @@ impl Overlay {
         self.refresh_magnifier();
 
         if event.button == MouseButton::Right {
-            // Right click backs out one level: first the tool, then the overlay.
-            if self.text.is_some() {
-                self.text = None;
-            } else if self.tool.is_some() {
-                self.tool = None;
-            } else {
-                self.cancel(window, cx);
-                return;
-            }
-            cx.notify();
+            // Right click backs out one level — and all of it happens on the
+            // *release*, in `on_mouse_up`: closing the window here would leave
+            // the matching release to the window behind, which is how a right
+            // click meant to cancel a screenshot ends up opening the context
+            // menu of whatever was under it.
             return;
         }
 
         if event.button != MouseButton::Left {
             return;
-        }
-
-        // Double-clicking inside the selection finishes the shot, exactly as it
-        // does in QQ's tool. It is also the only finish gesture that is
-        // instantaneous: GPUI holds the Enter key back briefly to see whether
-        // it starts a multi-key binding, but mouse events are never delayed.
-        //
-        // The text tool is included because a label is never entered by
-        // double-clicking, and leaving it armed after typing is the common
-        // case.
-        if event.click_count >= 2 && matches!(self.tool, None | Some(Tool::Text)) {
-            if let Some(selection) = self.selection {
-                if selection.contains(position) {
-                    let mode = default_finish(cx);
-                    self.finish(mode, window, cx);
-                    return;
-                }
-            }
         }
 
         if self.text.is_some() {
@@ -1373,10 +1364,50 @@ impl Overlay {
         cx.notify();
     }
 
-    fn on_mouse_up(&mut self, event: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn on_mouse_up(&mut self, event: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
         if self.frame_only {
             self.end_frame_drag(cx);
             return;
+        }
+        // Gestures that *end* the session run here rather than on the press: a
+        // window that closes on its press leaves the matching release in the
+        // air, and Windows hands that release to whatever is behind — which
+        // reads it as a click of its own. On the release, the button is already
+        // spent on this window and nothing else sees it.
+        if event.button == MouseButton::Right {
+            // Right click backs out one level: first the tool, then the overlay.
+            if self.text.is_some() {
+                self.text = None;
+            } else if self.tool.is_some() {
+                self.tool = None;
+            } else {
+                self.cancel(window, cx);
+                return;
+            }
+            cx.notify();
+            return;
+        }
+        if event.button != MouseButton::Left {
+            return;
+        }
+        // Double-clicking inside the selection finishes the shot, exactly as it
+        // does in QQ's tool. It is also the only finish gesture that is
+        // instantaneous: GPUI holds the Enter key back briefly to see whether
+        // it starts a multi-key binding, but mouse events are never delayed.
+        //
+        // The text tool is included because a label is never entered by
+        // double-clicking, and leaving it armed after typing is the common
+        // case.
+        if event.click_count >= 2 && matches!(self.tool, None | Some(Tool::Text)) {
+            let position = self.local(event.position);
+            if let Some(selection) = self.selection {
+                if selection.contains(position) {
+                    self.drag = None;
+                    let mode = default_finish(cx);
+                    self.finish(mode, window, cx);
+                    return;
+                }
+            }
         }
         if self.radius_drag {
             self.radius_drag = false;
@@ -2812,7 +2843,15 @@ impl Overlay {
                 .bg(if active { rgb(0x1E88E5) } else { rgba(0x0000_0000) })
                 .cursor_pointer()
                 .hover(|style| style.bg(rgb(0x3C3C3C)))
-                .on_mouse_down(
+                // The press belongs to the button — it must not fall through to
+                // the capture surface and start a new selection under it — but
+                // the action runs on the *release*: a button that closes the
+                // window on its press leaves its own release in the air, and
+                // that release lands on whatever is behind. See `end_session`.
+                .on_mouse_down(MouseButton::Left, cx.listener(|_, _event, _, cx| {
+                    cx.stop_propagation();
+                }))
+                .on_mouse_up(
                     MouseButton::Left,
                     cx.listener(move |this, _event, window, cx| {
                         this.apply(action, window, cx);
@@ -3132,7 +3171,11 @@ impl Render for Overlay {
                 .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
                 .on_mouse_down(MouseButton::Right, cx.listener(Self::on_mouse_down))
                 .on_mouse_move(cx.listener(Self::on_mouse_move))
-                .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up)),
+                .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
+                // The right button's gesture is finished on its release too: it
+                // is the one that cancels the capture, and the window must still
+                // be there when the button comes up.
+                .on_mouse_up(MouseButton::Right, cx.listener(Self::on_mouse_up)),
         );
 
         // Everything clickable goes *above* the capture surface: it is a

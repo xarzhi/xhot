@@ -363,12 +363,12 @@ fn end_session(cx: &mut App, restore_overlay: bool) {
 /// has been given back — the whole screen again — while what it last painted is
 /// a bare frame over a transparent surface. A window in that state is invisible
 /// and eats every click on the desktop, and the only way out of it is a right
-/// click landing on the window itself to close it. Hiding it here removes any
-/// dependence on when that later frame arrives.
+/// click landing on the window itself to close it. [`crate::app::retire_window`]
+/// is that same order, for every window of ours that closes.
 fn remove_overlay(cx: &mut App, handle: gpui_kit::WindowHandle<crate::ui::overlay::Overlay>) {
-    win_util::set_window_region(app::OVERLAY_TITLE, &[]);
-    win_util::hide_window(app::OVERLAY_TITLE);
-    let _ = handle.update(cx, |_, window, _| window.remove_window());
+    let _ = handle.update(cx, |_, window, _| {
+        app::retire_window(app::OVERLAY_TITLE, window);
+    });
 }
 
 /// Stops the frame from being dragged any more, once frames are being captured.

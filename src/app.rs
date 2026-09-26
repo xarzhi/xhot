@@ -171,6 +171,28 @@ pub fn open_settings(cx: &mut App) {
     }
 }
 
+/// Takes one of our windows off the screen for good.
+///
+/// `Window::remove_window` only asks the toolkit to drop the window, and the
+/// toolkit does that on a later frame — of which there may be none, because
+/// these windows are usually the last ones the app has. Until that frame, the
+/// Win32 window is still there: whatever it has already painted may be gone
+/// while the window itself still takes every click that lands on it. The user
+/// then sees clicks do nothing anywhere on screen, and the only way out is
+/// another click landing on that window itself.
+///
+/// So Win32 is told first. The window is hidden and its region given back —
+/// a region is what decides which clicks the window can take — and only then is
+/// the toolkit asked to drop it.
+///
+/// The title is the only handle Win32-side; every close path here knows the
+/// title of the window it is closing.
+pub fn retire_window(title: &str, window: &mut Window) {
+    util::set_window_region(title, &[]);
+    util::hide_window(title);
+    window.remove_window();
+}
+
 /// Closes the capture session: the save window (if any) and the overlay.
 ///
 /// A save finishes the session, so both windows go together.
@@ -183,10 +205,9 @@ pub fn close_capture(cx: &mut App) {
     // Before the overlay goes: while we still own the foreground, give it back.
     restore_foreground(cx);
     if let Some(handle) = state_mut(cx).overlay.take() {
-        let _ = handle.update(cx, |_, window, _| window.remove_window());
+        let _ = handle.update(cx, |_, window, _| retire_window(OVERLAY_TITLE, window));
     }
-    // Win32 first as well: a window left in the toolkit's removal queue is an
-    // invisible full-screen window that eats every click.
+    // Twice over: the window above may never have existed.
     util::set_window_region(OVERLAY_TITLE, &[]);
     util::hide_window(OVERLAY_TITLE);
 }
@@ -274,7 +295,7 @@ pub fn trigger_capture(cx: &mut App) {
             Err(error) => {
                 eprintln!("xshot: capture failed: {error:#}");
                 // The empty window must not be left behind.
-                let _ = handle.update(cx, |_, window, _| window.remove_window());
+                let _ = handle.update(cx, |_, window, _| retire_window(OVERLAY_TITLE, window));
                 state_mut(cx).overlay = None;
             }
         });
@@ -344,7 +365,7 @@ fn install_overlay(
     // Fix the geometry before the frame is drawn, so what is presented matches
     // the client area exactly.
     if util::place_client_exact(OVERLAY_TITLE, x, y, w, h).is_none() {
-        let _ = handle.update(cx, |_, window, _| window.remove_window());
+        let _ = handle.update(cx, |_, window, _| retire_window(OVERLAY_TITLE, window));
         state_mut(cx).overlay = None;
         return;
     }
