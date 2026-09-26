@@ -126,6 +126,12 @@ pub struct Config {
     /// How much the desktop is darkened outside the selection (0.0 - 0.8).
     pub dim_strength: f32,
 
+    // -- 录像 ---------------------------------------------------------------
+    /// Container the recorder writes.
+    pub record_format: crate::win::encode::Format,
+    /// Frames per second the recorder aims for.
+    pub record_fps: u32,
+
     // -- 快捷键 -------------------------------------------------------------
     /// Global capture hotkey, e.g. `Ctrl+Alt+A`.
     pub hotkey_capture: String,
@@ -152,6 +158,8 @@ impl Default for Config {
             finish_action: FinishAction::default(),
             mosaic_block: 10.0,
             dim_strength: 0.42,
+            record_format: crate::win::encode::Format::Mp4,
+            record_fps: crate::win::encode::DEFAULT_RATE,
             // The user's own bindings. Both are plain function keys by
             // request; the settings page turns them red when another program
             // already owns one, and they can be re-recorded there.

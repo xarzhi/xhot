@@ -20,6 +20,13 @@
 //!
 //! The window is excluded from screen capture, so the toolbar the user sees is
 //! never part of the video, even when the region covers the whole desktop.
+//!
+//! Nothing opens this yet: the capture toolbar has the long-shot button but not
+//! the record button, so the whole recording path — this window, the encoder and
+//! the session loop — is complete but unreachable. That is what the allows below
+//! are about, and they can go the moment the button lands.
+
+#![allow(dead_code)]
 
 use gpui_kit::*;
 

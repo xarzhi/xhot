@@ -18,7 +18,7 @@ use async_channel::Sender;
 use windows::Win32::Foundation::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    RegisterHotKey, UnregisterHotKey, VK_CONTROL, GetAsyncKeyState,
+    HOT_KEY_MODIFIERS, RegisterHotKey, UnregisterHotKey, VK_CONTROL, GetAsyncKeyState,
 };
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -44,21 +44,28 @@ pub enum Command {
     /// Whether each configured chord could actually be claimed. Windows lets
     /// only one program own a chord, so this is how a conflict reaches the UI.
     HotkeyStatus { capture: bool, restore: bool },
+    /// The session stop key was pressed (Esc while a session is running).
+    StopCapture,
 }
 
 /// `WM_APP + 1`: the tray icon's callback message.
 const WM_TRAY: u32 = WM_APP + 1;
 /// `WM_APP + 2`: re-read the hotkey configuration.
 const WM_APPLY_HOTKEYS: u32 = WM_APP + 2;
+/// `WM_APP + 3`: claim or release the session stop key. `wparam` is the state.
+const WM_APP_STOP_HOTKEY: u32 = WM_APP + 3;
 
 const HOTKEY_CAPTURE_ID: i32 = 0xA501;
 const HOTKEY_RESTORE_ID: i32 = 0xA502;
+/// Claimed only while a capture session is running.
+const HOTKEY_STOP_ID: i32 = 0xA503;
 const TRAY_ICON_ID: u32 = 1;
 
 const MENU_CAPTURE: usize = 1001;
 const MENU_SETTINGS: usize = 1002;
 const MENU_EXIT: usize = 1003;
 const MENU_RESTORE: usize = 1004;
+const MENU_STOP: usize = 1005;
 
 static COMMANDS: OnceLock<Sender<Command>> = OnceLock::new();
 static TRAY_HWND: AtomicIsize = AtomicIsize::new(0);
@@ -318,6 +325,85 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
     }
 }
 
+/// Claims or releases `Esc` for the duration of a capture session.
+///
+/// A bare `Esc` is claimed from every other program while it is held, which is
+/// exactly what a running session wants — the user is scrolling or watching, not
+/// typing — and it is released the moment the session ends. Claiming only works
+/// on the thread that owns the message queue, so this posts the request there.
+pub fn arm_stop_hotkey(armed: bool) {
+    let hwnd = TRAY_HWND.load(Ordering::SeqCst);
+    if hwnd == 0 {
+        return;
+    }
+    unsafe {
+        let _ = PostMessageW(
+            Some(HWND(hwnd as *mut _)),
+            WM_APP_STOP_HOTKEY,
+            WPARAM(armed as usize),
+            LPARAM(0),
+        );
+    }
+}
+
+/// Shows a notification-area balloon.
+///
+/// Used for things that finish while our windows are out of the way — a saved
+/// recording, or a scrolling shot that found nothing to stitch — which otherwise
+/// end in silence.
+pub fn notify(message: &str) {
+    let hwnd = TRAY_HWND.load(Ordering::SeqCst);
+    if hwnd == 0 {
+        return;
+    }
+    unsafe {
+        use windows::Win32::UI::Shell::{NIF_INFO, NIM_MODIFY, Shell_NotifyIconW};
+        let mut data = NOTIFYICONDATAW {
+            cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+            hWnd: HWND(hwnd as *mut _),
+            uID: TRAY_ICON_ID,
+            uFlags: NIF_INFO,
+            ..Default::default()
+        };
+        let title: Vec<u16> = "xshot".encode_utf16().collect();
+        copy_into(&mut data.szInfoTitle, &title);
+        let body: Vec<u16> = message.encode_utf16().collect();
+        copy_into(&mut data.szInfo, &body);
+        let _ = Shell_NotifyIconW(NIM_MODIFY, &data);
+    }
+}
+
+/// Fills a fixed-size UTF-16 field, leaving the terminator in place.
+fn copy_into(field: &mut [u16], text: &[u16]) {
+    let room = field.len().saturating_sub(1);
+    let length = text.len().min(room);
+    field[..length].copy_from_slice(&text[..length]);
+    field[length] = 0;
+}
+
+/// Claims or releases the session's stop key on the tray thread.
+///
+/// The claim has to be made from the thread that owns the window the hotkey is
+/// registered against, which is the tray thread, so [`arm_stop_hotkey`] posts
+/// here rather than calling `RegisterHotKey` itself.
+unsafe fn set_stop_hotkey(hwnd: HWND, armed: bool) {
+    unsafe {
+        use windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
+        if armed {
+            match RegisterHotKey(Some(hwnd), HOTKEY_STOP_ID, HOT_KEY_MODIFIERS(0), VK_ESCAPE.0 as u32)
+            {
+                Ok(()) => crate::trace_log!("xshot: Esc 已接管，用于结束长截图/录像"),
+                Err(error) => {
+                    crate::trace_log!("xshot: 无法接管 Esc（{error}），请用托盘菜单结束")
+                }
+            }
+        } else {
+            let _ = UnregisterHotKey(Some(hwnd), HOTKEY_STOP_ID);
+        }
+    }
+}
+
+/// Shows the tray's context menu and turns the choice into a command.
 unsafe fn show_menu(hwnd: HWND) {
     unsafe {
         let Ok(menu) = CreatePopupMenu() else {
@@ -325,6 +411,11 @@ unsafe fn show_menu(hwnd: HWND) {
         };
         let _ = AppendMenuW(menu, MF_STRING, MENU_CAPTURE, w!("截图"));
         let _ = AppendMenuW(menu, MF_STRING, MENU_RESTORE, w!("恢复上次贴图"));
+        // Only while a session is running: it is the way out for anyone the Esc
+        // claim did not reach.
+        if crate::capture::is_active() {
+            let _ = AppendMenuW(menu, MF_STRING, MENU_STOP, w!("结束长截图/录像"));
+        }
         let _ = AppendMenuW(menu, MF_STRING, MENU_SETTINGS, w!("打开设置"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(menu, MF_STRING, MENU_EXIT, w!("退出程序"));
@@ -350,6 +441,7 @@ unsafe fn show_menu(hwnd: HWND) {
         match chosen.0 as usize {
             MENU_CAPTURE => send(Command::Capture),
             MENU_RESTORE => send(Command::RestorePin),
+            MENU_STOP => send(Command::StopCapture),
             MENU_SETTINGS => send(Command::ShowSettings),
             MENU_EXIT => send(Command::Quit),
             _ => {}
@@ -380,12 +472,17 @@ unsafe extern "system" fn window_proc(
                 match wparam.0 as i32 {
                     HOTKEY_CAPTURE_ID => send(Command::Capture),
                     HOTKEY_RESTORE_ID => send(Command::RestorePin),
+                    HOTKEY_STOP_ID => send(Command::StopCapture),
                     _ => {}
                 }
                 LRESULT(0)
             }
             WM_APPLY_HOTKEYS => {
                 apply_hotkeys(hwnd);
+                LRESULT(0)
+            }
+            WM_APP_STOP_HOTKEY => {
+                set_stop_hotkey(hwnd, wparam.0 != 0);
                 LRESULT(0)
             }
             WM_CLOSE => {
@@ -396,6 +493,7 @@ unsafe extern "system" fn window_proc(
                 remove_icon(hwnd);
                 let _ = UnregisterHotKey(Some(hwnd), HOTKEY_CAPTURE_ID);
                 let _ = UnregisterHotKey(Some(hwnd), HOTKEY_RESTORE_ID);
+                let _ = UnregisterHotKey(Some(hwnd), HOTKEY_STOP_ID);
                 let hook = MOUSE_HOOK.swap(0, Ordering::SeqCst);
                 if hook != 0 {
                     let _ = UnhookWindowsHookEx(HHOOK(hook as *mut _));

@@ -19,6 +19,8 @@ use crate::win::{tray, util as win_util};
 pub const SETTINGS_TITLE: &str = "xshot 设置";
 pub const OVERLAY_TITLE: &str = "xshot-overlay";
 pub const SAVE_TITLE: &str = "xshot 保存";
+/// A session's own toolbar (recording), in a window of its own.
+pub const RECORD_BAR_TITLE: &str = "xshot-record-bar";
 pub const PIN_TITLE_PREFIX: &str = "xshot-pin-";
 
 /// Everything needed to put a pinned shot back on screen later.
@@ -41,6 +43,8 @@ pub struct AppState {
     pub overlay: Option<WindowHandle<Overlay>>,
     /// The "where should this go?" window, while one is open.
     pub save_dialog: Option<AnyWindowHandle>,
+    /// A session's toolbar, while a recording is being set up or run.
+    pub record_bar: Option<AnyWindowHandle>,
     pub pins: Vec<AnyWindowHandle>,
     pub next_pin_id: u32,
     /// The most recent pin, for the restore hotkey.
@@ -48,23 +52,62 @@ pub struct AppState {
     /// Whether the tray thread managed to claim each global chord. `None`
     /// until it has reported in.
     pub hotkey_status: Option<(bool, bool)>,
+    /// The window the user was in when we took the foreground, as a raw HWND.
+    ///
+    /// A capture starts by stealing the foreground, and destroying the window
+    /// that owns it leaves *no* foreground window at all. Our next capture could
+    /// then not take it back, and the overlay would receive no keystroke —
+    /// Enter, Esc and the tool shortcuts all dead, which reads as the program
+    /// having stopped responding. So it is remembered, and handed back when the
+    /// capture ends.
+    pub previous_foreground: isize,
 }
 
 impl Global for AppState {}
 
 impl AppState {
+    /// Takes the remembered foreground window, if there is one left to restore.
+    fn take_previous_foreground(&mut self) -> Option<isize> {
+        (self.previous_foreground != 0).then(|| std::mem::take(&mut self.previous_foreground))
+    }
+
     pub fn new(config: Config) -> Self {
         Self {
             config,
             settings: None,
             overlay: None,
             save_dialog: None,
+            record_bar: None,
             pins: Vec::new(),
             next_pin_id: 1,
             last_pin: None,
             hotkey_status: None,
+            previous_foreground: 0,
         }
     }
+}
+
+/// Remembers who owns the foreground before a capture takes it.
+pub fn note_foreground(cx: &mut App) {
+    state_mut(cx).previous_foreground = util::foreground_window()
+        .map(|hwnd| hwnd.0 as isize)
+        .unwrap_or(0);
+}
+
+/// Hands the foreground back to whoever had it before the capture.
+///
+/// Called as a capture session closes, and it has to happen *before* the window
+/// that currently owns the foreground is destroyed: once there is no foreground
+/// window, Windows no longer lets us give it to anyone.
+pub fn restore_foreground(cx: &mut App) {
+    if let Some(previous) = state_mut(cx).take_previous_foreground() {
+        util::restore_foreground(previous);
+    }
+}
+
+/// Device pixels per logical pixel on the primary display.
+pub fn scale_factor(cx: &App) -> f32 {
+    estimate_scale(cx, crate::win::util::virtual_screen())
 }
 
 pub fn state(cx: &App) -> &AppState {
@@ -133,9 +176,19 @@ pub fn open_settings(cx: &mut App) {
 /// A save finishes the session, so both windows go together.
 pub fn close_capture(cx: &mut App) {
     crate::ui::save_dialog::close(cx);
+    crate::ui::record_bar::close(cx);
+    // The save window's button fires on the press, and the overlay may have gone
+    // the same way earlier; either of them could still be holding the capture.
+    util::release_capture();
+    // Before the overlay goes: while we still own the foreground, give it back.
+    restore_foreground(cx);
     if let Some(handle) = state_mut(cx).overlay.take() {
         let _ = handle.update(cx, |_, window, _| window.remove_window());
     }
+    // Win32 first as well: a window left in the toolkit's removal queue is an
+    // invisible full-screen window that eats every click.
+    util::set_window_region(OVERLAY_TITLE, &[]);
+    util::hide_window(OVERLAY_TITLE);
 }
 
 /// Closes just the save window, leaving the capture open to keep editing.
@@ -170,6 +223,11 @@ pub fn close_settings(cx: &mut App) {
 /// is built (hidden) while it is in flight. Measured on this machine, that takes
 /// the hotkey-to-visible walk from ~50 ms to ~33 ms.
 pub fn trigger_capture(cx: &mut App) {
+    // A scrolling shot or a recording has the screen to itself; a new overlay
+    // dropped on top of one would end up in its own output.
+    if crate::capture::is_active() {
+        return;
+    }
     if state(cx).overlay.is_some() {
         let handle = state(cx).overlay.unwrap();
         if handle.update(cx, |_, _, _| {}).is_ok() {
@@ -184,6 +242,10 @@ pub fn trigger_capture(cx: &mut App) {
     // off screen, so no guessed delay is needed before the capture.
     win_util::hide_window_and_wait(SETTINGS_TITLE, Duration::from_millis(250));
     crate::timing("2 own windows hidden");
+
+    // Remember who had the foreground before the overlay takes it, so it can be
+    // handed back when the capture ends.
+    note_foreground(cx);
 
     // Start the grab first, then spend the window build on top of it.
     let started = std::time::Instant::now();
@@ -357,7 +419,10 @@ pub fn show_pin(cx: &mut App, spec: PinSpec, scale: f32) {
         show: true,
         is_resizable: false,
         is_movable: true,
-        window_background: WindowBackgroundAppearance::Opaque,
+        // Transparent rather than opaque: a finished shot can have rounded
+        // corners cut into its alpha, and an opaque window shows its own clear
+        // colour — black — in all four of them.
+        window_background: WindowBackgroundAppearance::Transparent,
         ..Default::default()
     };
 

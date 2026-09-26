@@ -543,6 +543,158 @@ fn flush_composition() {
     }
 }
 
+/// Gives up the mouse capture, if this thread's window holds one.
+///
+/// GPUI takes the capture on every mouse *press*, and only the matching release
+/// gives it back. Every window of ours that closes on the press — the overlay's
+/// buttons, the session toolbars — therefore loses the release, and the capture
+/// then still belongs to a window nobody can see: Windows keeps delivering every
+/// later click to it, which is exactly the "after a screenshot, clicking
+/// anything does nothing" state. Capture is per-thread, so this has to run on
+/// the UI thread, which is where every one of those close paths runs.
+pub fn release_capture() {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetCapture, ReleaseCapture};
+    unsafe {
+        if !GetCapture().is_invalid() {
+            let _ = ReleaseCapture();
+        }
+    }
+}
+
+/// Restricts a window to a set of rectangles, in client coordinates.
+///
+/// A window's region is not merely a clipping shape: the parts of a window
+/// outside it do not exist as far as the mouse is concerned. That is the only
+/// way to keep a frame on screen while every click outside it still belongs to
+/// the application underneath. An empty list gives the whole window back.
+pub fn set_window_region(title: &str, rects: &[(i32, i32, i32, i32)]) -> bool {
+    use windows::Win32::Graphics::Gdi::{
+        CombineRgn, CreateRectRgn, DeleteObject, HGDIOBJ, RGN_OR, SetWindowRgn,
+    };
+
+    let Some(hwnd) = find_window(title) else {
+        return false;
+    };
+    unsafe {
+        if rects.is_empty() {
+            // `None` means "no region": the window is its whole rectangle again.
+            return SetWindowRgn(hwnd, None, true) != 0;
+        }
+        let combined = CreateRectRgn(0, 0, 0, 0);
+        if combined.is_invalid() {
+            return false;
+        }
+        for (x, y, w, h) in rects {
+            let part = CreateRectRgn(*x, *y, x + w, y + h);
+            if part.is_invalid() {
+                continue;
+            }
+            let _ = CombineRgn(Some(combined), Some(combined), Some(part), RGN_OR);
+            let _ = DeleteObject(HGDIOBJ(part.0));
+        }
+        // The system takes ownership of the region once it has been set; it must
+        // only be deleted when the call failed.
+        if SetWindowRgn(hwnd, Some(combined), true) != 0 {
+            true
+        } else {
+            let _ = DeleteObject(HGDIOBJ(combined.0));
+            false
+        }
+    }
+}
+
+/// Sets or clears `WS_EX_NOACTIVATE`, so clicking a window never takes the
+/// foreground from the application underneath.
+///
+/// Not reachable yet: only the recording toolbar wants this, and its button is
+/// not in the capture toolbar.
+#[allow(dead_code)]
+pub fn set_no_activate(title: &str, enabled: bool) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GWL_EXSTYLE, GetWindowLongPtrW, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+        SWP_NOZORDER, SetWindowLongPtrW, SetWindowPos, WS_EX_NOACTIVATE,
+    };
+    let Some(hwnd) = find_window(title) else {
+        return false;
+    };
+    unsafe {
+        let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        let next = if enabled {
+            style | WS_EX_NOACTIVATE.0 as isize
+        } else {
+            style & !(WS_EX_NOACTIVATE.0 as isize)
+        };
+        if next == style {
+            return true;
+        }
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, next);
+        // The style only takes effect on a window whose frame has been
+        // recalculated, and the frame must not be activated on the way.
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            0,
+            0,
+            SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER,
+        );
+        true
+    }
+}
+
+/// Keeps a window out of screen captures, or lets it back in.
+///
+/// `WDA_EXCLUDEFROMCAPTURE` is what Windows offers instead of the old
+/// "click through and hope `BitBlt` misses it" arrangement: `BitBlt` *does* see
+/// a DirectComposition window, so the recording toolbar has to be excluded
+/// explicitly or it would be recorded into its own video.
+///
+/// Not reachable yet along with the rest of the recording path.
+#[allow(dead_code)]
+pub fn set_capture_excluded(title: &str, enabled: bool) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE, WDA_NONE,
+    };
+    let Some(hwnd) = find_window(title) else {
+        return false;
+    };
+    let affinity = if enabled {
+        WDA_EXCLUDEFROMCAPTURE
+    } else {
+        WDA_NONE
+    };
+    unsafe { SetWindowDisplayAffinity(hwnd, affinity).is_ok() }
+}
+
+/// Hands the foreground back to a window that had it before one of ours took it.
+///
+/// Windows only lets the owner of the foreground give it away, and it ignores a
+/// request from a process the user is not interacting with. Attaching our input
+/// queue to the target's for the duration makes the call look like it comes from
+/// that thread, which is what makes it go through.
+pub fn restore_foreground(previous: isize) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+    use windows::Win32::UI::WindowsAndMessaging::{GetWindowThreadProcessId, SetForegroundWindow};
+
+    let target = HWND(previous as *mut core::ffi::c_void);
+    if target.is_invalid() {
+        return;
+    }
+    unsafe {
+        let owner = GetWindowThreadProcessId(target, None);
+        let current = GetCurrentThreadId();
+        let attached = owner != 0
+            && owner != current
+            && AttachThreadInput(current, owner, true).as_bool();
+        let _ = SetForegroundWindow(target);
+        if attached {
+            let _ = AttachThreadInput(current, owner, false);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

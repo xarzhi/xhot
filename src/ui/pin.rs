@@ -317,7 +317,10 @@ impl Pin {
             show: true,
             is_resizable: false,
             is_movable: false,
-            window_background: WindowBackgroundAppearance::Opaque,
+            // The menu is a rounded card, so its window has to be transparent
+            // for the same reason a pin's does: an opaque one fills the corners
+            // with its clear colour.
+            window_background: WindowBackgroundAppearance::Transparent,
             ..Default::default()
         };
 
@@ -622,13 +625,19 @@ impl Render for Pin {
         }
         let theme = self.theme;
         let _ = &self.ocr_state;
+        // The finished shot is rounded in device pixels at capture time, so the
+        // pin draws the same shape rather than a square window around it. Zoom
+        // scales the corners with everything else, which is what keeps them
+        // matching; `scale` cancels out because the radius is logical here.
+        let radius = app::state(cx).config.corner_radius.clamp(0.0, 96.0) * self.zoom;
 
         let mut root = div()
             .id("xshot-pin")
             .relative()
             .size_full()
             .overflow_hidden()
-            .bg(rgb(0x000000))
+            // No fill: the window is transparent, and the only part of it that
+            // should show through is the corner the shot's alpha cuts away.
             .cursor(if self.over_text {
                 CursorStyle::IBeam
             } else {
@@ -643,6 +652,7 @@ impl Render for Pin {
                     .top_0()
                     .w_full()
                     .h_full()
+                    .rounded(px(radius))
                     .object_fit(ObjectFit::Fill),
             )
             .children(self.highlights(theme));

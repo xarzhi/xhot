@@ -18,9 +18,8 @@ const FAMILY: &str = "iconfont";
 /// One code point per glyph, straight from `assets/iconfont/iconfont.json`.
 ///
 /// The font also carries `up-arrow`, `down-arrow`, `right-arrow` and
-/// `left-arrow` (`e642`, `e643`, `eca7`, `eca8`), plus `长截图` (`e601`) and
-/// `录屏` (`e60a`) which the long-shot and recording buttons will want when they
-/// come back — nothing draws any of them yet.
+/// `left-arrow` (`e642`, `e643`, `eca7`, `eca8`) and `录屏` (`e60a`) which
+/// nothing draws yet.
 pub mod glyph {
     pub const ARROW: &str = "\u{e630}";
     pub const SAVE: &str = "\u{ec09}";
@@ -44,6 +43,8 @@ pub mod glyph {
     pub const PEN: &str = "\u{e600}";
     /// The letter T, which the font files under `文字`.
     pub const TEXT: &str = "\u{e732}";
+    /// The scrolling shot, which the font files under `长截图`.
+    pub const LONG_SHOT: &str = "\u{e601}";
 }
 
 /// Registers the font. Call once, before the first window exists.

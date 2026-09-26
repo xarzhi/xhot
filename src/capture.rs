@@ -78,6 +78,7 @@ pub fn progress() -> Option<(Duration, usize)> {
 
 /// Ends whatever session is running. Called when the stop key arrives.
 pub fn stop() {
+    crate::timing("s stop requested");
     ACTIVE.store(false, Ordering::SeqCst);
 }
 
@@ -127,6 +128,7 @@ pub fn start_scrolling(cx: &mut App, region: (i32, i32, i32, i32)) {
         return;
     }
     set_region(region);
+    crate::timing("s scrolling session started");
     cx.spawn(async move |cx| {
         let stitched = cx
             .background_executor()
@@ -136,11 +138,13 @@ pub fn start_scrolling(cx: &mut App, region: (i32, i32, i32, i32)) {
             // The shot is finished, so the capture is over: hand it to the save
             // window and let the overlay go.
             Some(shot) => {
+                crate::timing("s stitching done");
                 end_session(cx, false);
                 crate::ui::save_dialog::open(cx, shot);
             }
             // Nothing usable: put the user back where they were.
             None => {
+                crate::timing("s nothing to stitch");
                 end_session(cx, true);
                 tray::notify("长截图没有采集到可拼接的内容");
             }
@@ -156,6 +160,11 @@ pub fn start_scrolling(cx: &mut App, region: (i32, i32, i32, i32)) {
 /// have to be settled before the first frame, a file cannot change container
 /// halfway through, and the frame can still be dragged somewhere else until the
 /// recording begins.
+///
+/// Not reachable yet: the capture toolbar has the long-shot button but no record
+/// button, so nothing calls this. The rest of the recording path is here and
+/// working, waiting for that button.
+#[allow(dead_code)]
 pub fn start_recording(cx: &mut App, region: (i32, i32, i32, i32)) {
     if !begin() {
         return;

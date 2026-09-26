@@ -27,6 +27,14 @@ enum Finish {
     Pin,
 }
 
+/// Which long-running capture the user asked for.
+#[derive(Clone, Copy)]
+enum Session {
+    /// Keep grabbing the framed region while the user scrolls the window
+    /// underneath, and stitch the new rows into one tall shot.
+    Scrolling,
+}
+
 /// A toolbar button press.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Action {
@@ -37,6 +45,7 @@ enum Action {
     EraserSize(f32),
     Block(f32),
     Undo,
+    LongShot,
     Copy,
     Save,
     Pin,
@@ -345,6 +354,21 @@ pub struct Overlay {
     shapes: Vec<Shape>,
     draft: Option<Shape>,
     text: Option<TextEdit>,
+    /// Set while a session owns this window.
+    ///
+    /// The overlay is then a bare frame over the live desktop: no frozen
+    /// screenshot, no dimming, none of the tools. Only the frame itself is still
+    /// part of the window — the rest of its region is cut away — so every click
+    /// that does not land on those few pixels belongs to the application
+    /// underneath, which is the whole point of a scrolling shot.
+    frame_only: bool,
+    /// Set once frames are actually being captured, which stops the frame from
+    /// being dragged: a shot that is being stitched has to keep the same
+    /// rectangle from beginning to end.
+    frame_locked: bool,
+    /// While the frame is being dragged: where the cursor started, and where the
+    /// selection was at that moment. Both in physical screen pixels.
+    frame_drag: Option<((i32, i32), Rect)>,
 }
 
 /// Which icon a toolbar button shows.
@@ -356,6 +380,8 @@ pub struct Overlay {
 enum Art {
     Tool(Tool),
     Undo,
+    /// Stitch a scrolling window into one tall shot.
+    LongShot,
     Pin,
     Save,
     Copy,
@@ -368,6 +394,7 @@ impl Art {
         match self {
             Art::Tool(tool) => tool.label(),
             Art::Undo => "撤销",
+            Art::LongShot => "长截图",
             Art::Pin => "钉图",
             Art::Save => "保存",
             Art::Copy => "复制",
@@ -386,6 +413,7 @@ impl Art {
             Art::Tool(Tool::Eraser) => icons::icon(glyph::RUBBER, size, color),
             Art::Tool(Tool::Text) => icons::icon(glyph::TEXT, size, color),
             Art::Undo => icons::icon(glyph::REVOKE, size, color),
+            Art::LongShot => icons::icon(glyph::LONG_SHOT, size, color),
             Art::Pin => icons::icon(glyph::PIN, size, color),
             Art::Save => icons::icon(glyph::SAVE, size, color),
             Art::Copy => icons::icon(glyph::COPY, size, color),
@@ -451,6 +479,9 @@ impl Overlay {
             shapes: Vec::new(),
             draft: None,
             text: None,
+            frame_only: false,
+            frame_locked: false,
+            frame_drag: None,
         }
     }
 
@@ -486,6 +517,11 @@ impl Overlay {
         self.magnifier = None;
         self.hover_index_at = None;
         self.colour_copied = None;
+        // A session's frame state belongs to the session that set it; a window
+        // handed fresh pixels is framing again, whatever it was doing before.
+        self.frame_only = false;
+        self.frame_locked = false;
+        self.frame_drag = None;
         self.ready = true;
         crate::trace_log!(
             "xshot: overlay source installed frame={}x{}",
@@ -519,6 +555,201 @@ impl Overlay {
             shapes.push(draft.clone());
         }
         shapes
+    }
+
+    // -- sessions ---------------------------------------------------------
+
+    /// Hands the framed region to a long-running session.
+    ///
+    /// The overlay survives: the session reduces it to a bare frame, so the user
+    /// can see exactly what is being captured while driving the window
+    /// underneath, and an aborted one can put the tools back.
+    fn start_session(&mut self, cx: &mut Context<Self>, kind: Session) {
+        let Some(region) = self.selection.map(|_| self.screen_region()) else {
+            return;
+        };
+        match kind {
+            Session::Scrolling => {
+                // The frame is locked straight away: a scrolling shot has to
+                // keep the same rectangle from beginning to end.
+                self.set_frame_only(true);
+                self.set_frame_locked(true);
+                crate::capture::start_scrolling(cx, region);
+            }
+        }
+    }
+
+    /// Switches between normal framing and the stripped-down frame a session
+    /// leaves on screen.
+    pub fn set_frame_only(&mut self, frame_only: bool) {
+        if self.frame_only == frame_only {
+            return;
+        }
+        self.frame_only = frame_only;
+        if !frame_only {
+            // The tools come back with the frozen desktop, and so does the
+            // pointer the loupe follows.
+            self.magnifier = None;
+            self.pointer = None;
+            self.frame_locked = false;
+        }
+        self.frame_drag = None;
+        self.apply_frame_region();
+    }
+
+    /// Stops the frame being dragged, and thins it down.
+    pub fn set_frame_locked(&mut self, locked: bool) {
+        if self.frame_locked == locked {
+            return;
+        }
+        self.frame_locked = locked;
+        self.frame_drag = None;
+        self.apply_frame_region();
+    }
+
+    /// How thick the frame is drawn, in logical pixels.
+    ///
+    /// It sits on the *outside* of the region, so it costs the shot nothing, and
+    /// it is drawn only as thick as it needs to be to be seen at a glance.
+    fn frame_thickness(&self) -> f32 {
+        if self.frame_locked { 3.0 } else { 4.0 }
+    }
+
+    /// The four bands the frame occupies, in the window's client coordinates.
+    ///
+    /// They are drawn in logical pixels but a window region is in physical ones,
+    /// hence the map — which is exactly the ratio between the two.
+    fn frame_bands(&self) -> Vec<(i32, i32, i32, i32)> {
+        let Some(selection) = self.selection else {
+            return Vec::new();
+        };
+        let thickness = self.frame_thickness();
+        let (map_x, map_y) = self.map;
+        let (x, y, w, h, t) = (
+            selection.x * map_x,
+            selection.y * map_y,
+            selection.w * map_x,
+            selection.h * map_y,
+            thickness * map_x,
+        );
+        let (x, y, w, h) = (x.round(), y.round(), w.round(), h.round());
+        let t = t.round().max(1.0) as i32;
+        let (x, y, w, h) = (x as i32, y as i32, w as i32, h as i32);
+        vec![
+            (x - t, y - t, w + t * 2, t),
+            (x - t, y + h, w + t * 2, t),
+            (x - t, y, t, h),
+            (x + w, y, t, h),
+        ]
+    }
+
+    /// Hands the window only the frame, and gives up everything else.
+    ///
+    /// A window's region is what the mouse can see of it, so this is what lets
+    /// the desktop — and the taskbar, and any other window — be clicked while
+    /// the frame stays on screen.
+    fn apply_frame_region(&self) {
+        let bands = if self.frame_only {
+            self.frame_bands()
+        } else {
+            Vec::new()
+        };
+        win_util::set_window_region(app::OVERLAY_TITLE, &bands);
+    }
+
+    /// Starts dragging the frame to somewhere else on screen.
+    fn start_frame_drag(&mut self) {
+        if self.frame_locked {
+            return;
+        }
+        if let Some(selection) = self.selection {
+            self.frame_drag = Some((win_util::cursor_position(), selection));
+        }
+    }
+
+    /// Moves the frame with the cursor, keeping it on the desktop.
+    fn drag_frame(&mut self, cx: &mut Context<Self>) {
+        let Some((start_cursor, start_selection)) = self.frame_drag else {
+            return;
+        };
+        let now = win_util::cursor_position();
+        let (map_x, map_y) = self.map;
+        let dx = (now.0 - start_cursor.0) as f32 / map_x.max(0.0001);
+        let dy = (now.1 - start_cursor.1) as f32 / map_y.max(0.0001);
+        let (view_w, view_h) = self.view_size();
+        let mut moved = start_selection;
+        moved.x = (start_selection.x + dx).clamp(0.0, (view_w - moved.w).max(0.0));
+        moved.y = (start_selection.y + dy).clamp(0.0, (view_h - moved.h).max(0.0));
+        self.selection = Some(moved);
+        self.apply_frame_region();
+        // The region a session would use if it started now has to follow, but
+        // nothing else moves on every pixel: repositioning the toolbar means
+        // resizing a window and asking the toolkit for its entity again, and
+        // doing that per mouse sample is what makes the frame feel stuck.
+        crate::capture::set_region(self.screen_region());
+        cx.notify();
+    }
+
+    /// Ends a frame drag.
+    fn end_frame_drag(&mut self, cx: &mut Context<Self>) {
+        if self.frame_drag.take().is_none() {
+            return;
+        }
+        let region = self.screen_region();
+        crate::capture::set_region(region);
+        // Once, on release: the toolbar travels with the frame.
+        crate::ui::record_bar::reposition(cx, region);
+        cx.notify();
+    }
+
+    /// The framed region in physical screen pixels.
+    fn screen_region(&self) -> (i32, i32, i32, i32) {
+        let Some(selection) = self.selection else {
+            return (0, 0, 1, 1);
+        };
+        let (map_x, map_y) = self.map;
+        let origin = self.screen_origin;
+        (
+            (origin.0 + selection.x * map_x).round() as i32,
+            (origin.1 + selection.y * map_y).round() as i32,
+            (selection.w * map_x).round().max(1.0) as i32,
+            (selection.h * map_y).round().max(1.0) as i32,
+        )
+    }
+
+    /// The frame drawn around a session's region.
+    ///
+    /// It sits entirely *outside* the region: the region is exactly what gets
+    /// captured, so a border drawn on its edge — the way the selection outline
+    /// is while framing — would appear in every frame of the result.
+    fn session_frame(&self) -> Option<AnyElement> {
+        let selection = self.selection?;
+        let thickness = self.frame_thickness();
+        let accent = rgb(0xFF5252);
+        let edge = |x: f32, y: f32, w: f32, h: f32| -> AnyElement {
+            div()
+                .absolute()
+                .left(px(x))
+                .top(px(y))
+                .w(px(w))
+                .h(px(h))
+                .bg(accent)
+                .into_any_element()
+        };
+        let (x, y, w, h) = (selection.x, selection.y, selection.w, selection.h);
+        Some(
+            div()
+                .absolute()
+                .left_0()
+                .top_0()
+                .w_full()
+                .h_full()
+                .child(edge(x - thickness, y - thickness, w + thickness * 2.0, thickness))
+                .child(edge(x - thickness, y + h, w + thickness * 2.0, thickness))
+                .child(edge(x - thickness, y, thickness, h))
+                .child(edge(x + w, y, thickness, h))
+                .into_any_element(),
+        )
     }
 
     // -- text handling ----------------------------------------------------
@@ -684,6 +915,7 @@ impl Overlay {
             Action::Undo => {
                 self.shapes.pop();
             }
+            Action::LongShot => self.start_session(cx, Session::Scrolling),
             Action::Copy => self.finish(Finish::Copy, window, cx),
             Action::Save => self.finish(Finish::Save, window, cx),
             Action::Pin => self.finish(Finish::Pin, window, cx),
@@ -700,6 +932,17 @@ impl Overlay {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A bare frame has exactly one gesture: move the frame. Only the frame's
+        // own pixels are part of this window, so this is the only place a press
+        // can land.
+        if self.frame_only {
+            if event.button == MouseButton::Left {
+                self.start_frame_drag();
+                cx.notify();
+            }
+            return;
+        }
+
         let position = self.local(event.position);
         let (view_w, view_h) = self.view_size();
         // A press without a preceding move still has to place the loupe and the
@@ -864,6 +1107,11 @@ impl Overlay {
     }
 
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.frame_only {
+            self.drag_frame(cx);
+            return;
+        }
+
         let position = self.local(event.position);
         let (view_w, view_h) = self.view_size();
 
@@ -990,6 +1238,10 @@ impl Overlay {
     }
 
     fn on_mouse_up(&mut self, event: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.frame_only {
+            self.end_frame_drag(cx);
+            return;
+        }
         if self.radius_drag {
             self.radius_drag = false;
             cx.notify();
@@ -1444,6 +1696,17 @@ impl Overlay {
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
+        // A session owns this window while a frame is up over the live desktop:
+        // Esc has to end the *session*, so the rows that have been stitched are
+        // handed over, rather than closing the frame and throwing them away. The
+        // session's stop key may also arrive through the tray's global claim, in
+        // which case this never runs — both paths lead to the same place.
+        if self.frame_only {
+            if key == "escape" {
+                crate::capture::request_stop(cx);
+            }
+            return;
+        }
 
         // While the loupe is up: Shift swaps the colour notation and C puts the
         // sampled colour on the clipboard.
@@ -1537,6 +1800,8 @@ impl Overlay {
                 let mode = default_finish(cx);
                 self.finish(mode, window, cx);
             }
+            // Start stitching a scrolling shot of the framed region.
+            "l" => self.apply(Action::LongShot, window, cx),
             // Tool shortcuts, mirroring the toolbar buttons. Digits are the
             // primary binding; letters are there for muscle memory.
             "1" | "r" => self.arm(Tool::Rect, window, cx),
@@ -2575,6 +2840,7 @@ impl Overlay {
 
         let actions = vec![
             group(Art::Undo, false, Action::Undo),
+            group(Art::LongShot, false, Action::LongShot),
             group(Art::Pin, false, Action::Pin),
             group(Art::Save, false, Action::Save),
             group(Art::Copy, false, Action::Copy),
@@ -2661,8 +2927,10 @@ impl Render for Overlay {
             .size_full()
             .overflow_hidden()
             // Fully transparent until the capture arrives, so the desktop is
-            // what the user sees while this window is being filled in.
-            .bg(if self.ready {
+            // what the user sees while this window is being filled in — and
+            // transparent throughout a session, which is the whole point of
+            // leaving the frame up over the live desktop.
+            .bg(if self.ready && !self.frame_only {
                 rgb(0x000000)
             } else {
                 rgba(0x0000_0000)
@@ -2674,6 +2942,18 @@ impl Render for Overlay {
             // Nothing but the empty window: no frozen frame to show yet, and a
             // dimmed or black screen would be worse than not being there.
             return root;
+        }
+
+        // A session keeps the frame and nothing else: the frozen desktop and the
+        // dimming would both hide the application being worked in, and the tools
+        // are out of reach anyway — only the frame's own pixels are part of this
+        // window while this is set.
+        if self.frame_only {
+            return root
+                .children(self.session_frame())
+                .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+                .on_mouse_move(cx.listener(Self::on_mouse_move))
+                .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up));
         }
 
         root = root

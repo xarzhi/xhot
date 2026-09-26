@@ -42,6 +42,15 @@ features = [
     "Win32_System_Registry",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
+    # H.264 MP4 recording, through the media stack that ships with Windows.
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+    # Reading the desktop straight off the GPU, which is how the capture path
+    # fills a frozen frame faster than GDI's cross-process blit can.
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
     # Text recognition through the OCR engine that ships with Windows, so no
     # model has to be downloaded or bundled.
     "Win32_System_WinRT",

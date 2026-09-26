@@ -64,6 +64,13 @@ enum Recording {
 pub struct Settings {
     focus: FocusHandle,
     page: Page,
+    /// Where the current page is scrolled to.
+    ///
+    /// A page can easily be taller than the window — the general one is — and the
+    /// window is fixed-size, so the only way to reach the bottom cards is to
+    /// scroll. Kept per-window rather than per-page because switching pages
+    /// resets it.
+    content_scroll: ScrollHandle,
     recording: Recording,
     /// Keystrokes seen while recording, so a chord can be assembled.
     pending_modifiers: Modifiers,
@@ -80,6 +87,7 @@ impl Settings {
         Self {
             focus,
             page: Page::General,
+            content_scroll: ScrollHandle::new(),
             recording: Recording::None,
             pending_modifiers: Modifiers::default(),
             dragging: None,
@@ -250,22 +258,43 @@ impl Render for Settings {
                     .overflow_hidden()
                     .child(sidebar)
                     .child(
+                        // The page scrolls inside this column, and the scrollbar
+                        // is a *sibling* of the scroller rather than a child of
+                        // it: a child is painted with the scroll offset applied,
+                        // so the bar would slide off with the content.
                         div()
-                            .flex()
-                            .flex_col()
+                            .relative()
                             .flex_1()
-                            .gap(px(8.0))
-                            .px(px(28.0))
-                            .py(px(20.0))
+                            .h_full()
                             .overflow_hidden()
                             .child(
                                 div()
-                                    .text_size(px(TEXT_TITLE))
-                                    .text_color(theme.text)
-                                    .pb(px(8.0))
-                                    .child(page.label()),
+                                    .id("settings-content")
+                                    .size_full()
+                                    .overflow_y_scroll()
+                                    .track_scroll(&self.content_scroll)
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .gap(px(8.0))
+                                            .px(px(28.0))
+                                            .py(px(20.0))
+                                            .child(
+                                                div()
+                                                    .text_size(px(TEXT_TITLE))
+                                                    .text_color(theme.text)
+                                                    .pb(px(8.0))
+                                                    .child(page.label()),
+                                            )
+                                            .child(body),
+                                    ),
                             )
-                            .child(body),
+                            .child(
+                                gpui_kit::base::Scrollbar::vertical(&self.content_scroll)
+                                    .id("settings-scrollbar")
+                                    .viewport_from_layout(),
+                            ),
                     ),
             )
     }
@@ -361,6 +390,9 @@ impl Settings {
                         MouseButton::Left,
                         cx.listener(move |this, _event, _window, cx| {
                             this.page = page;
+                            // A new page starts at its top; keeping the old offset
+                            // would drop the reader into the middle of it.
+                            this.content_scroll.set_offset(point(px(0.0), px(0.0)));
                             cx.notify();
                         }),
                     );

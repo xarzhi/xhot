@@ -54,6 +54,7 @@ pub fn timing(label: &str) {    use std::io::Write;
 
 mod annot;
 mod app;
+mod capture;
 mod config;
 mod ui;
 mod win;
@@ -128,6 +129,15 @@ fn main() {
                 app::open_settings(cx);
             }
 
+            // Get the capture path ready while nobody is waiting: building the
+            // Direct3D device and the per-monitor duplications takes tens of
+            // milliseconds and the first frame has to come from GDI, and both
+            // belong at startup rather than in the walk from the hotkey to a
+            // frozen screen.
+            cx.background_executor()
+                .spawn(async { win::duplication::warm() })
+                .detach();
+
             // The tray thread never touches the UI directly; it posts commands
             // here and this task wakes the moment one arrives.
             cx.spawn(async move |cx| {
@@ -150,6 +160,10 @@ fn main() {
                             app::state_mut(cx).hotkey_status = Some((capture, restore));
                         }
                         win::tray::Command::Quit => app::quit(cx),
+                        // A session that is already running is finished by its
+                        // own worker; one that is still waiting for a start
+                        // button has none, so the UI thread takes it down here.
+                        win::tray::Command::StopCapture => capture::request_stop(cx),
                     });
                     if quitting {
                         break;

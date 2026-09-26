@@ -3,6 +3,8 @@
 
 pub mod autostart;
 pub mod clip;
+pub mod duplication;
+pub mod encode;
 pub mod frame;
 pub mod hotkey;
 pub mod icon;
