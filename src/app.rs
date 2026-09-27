@@ -40,7 +40,11 @@ pub struct PinSpec {
 pub struct AppState {
     pub config: Config,
     pub settings: Option<AnyWindowHandle>,
+    /// The capture overlay. Built once (see [`prepare_overlay`]) and kept hidden
+    /// between captures, so a capture never pays for the window again.
     pub overlay: Option<WindowHandle<Overlay>>,
+    /// Whether that window is on screen for a capture right now.
+    pub capture_active: bool,
     /// The "where should this go?" window, while one is open.
     pub save_dialog: Option<AnyWindowHandle>,
     /// A session's toolbar, while a recording is being set up or run.
@@ -61,6 +65,45 @@ pub struct AppState {
     /// having stopped responding. So it is remembered, and handed back when the
     /// capture ends.
     pub previous_foreground: isize,
+    /// The Ctrl+drag in flight, if there is one.
+    ///
+    /// The gesture starts on a window that is not ours — the press belongs to
+    /// whatever is underneath, and that window keeps the mouse for the whole
+    /// drag — so the overlay never sees a mouse event of its own. This is what it
+    /// draws instead, and what it pins when the button comes up. It lives here
+    /// rather than in the overlay because the drag can be over before the frozen
+    /// desktop has even been grabbed.
+    pub drag: Option<LiveDrag>,
+}
+
+/// A Ctrl+drag, in physical screen pixels.
+#[derive(Clone, Copy, Debug)]
+pub struct LiveDrag {
+    pub start: (i32, i32),
+    pub current: (i32, i32),
+    /// The button has come up: the drag is over, whether or not the window that
+    /// draws it is ready yet.
+    pub released: bool,
+}
+
+impl LiveDrag {
+    pub fn rect(&self) -> (i32, i32, i32, i32) {
+        let (x0, y0) = self.start;
+        let (x1, y1) = self.current;
+        (
+            x0.min(x1),
+            y0.min(y1),
+            (x1 - x0).abs(),
+            (y1 - y0).abs(),
+        )
+    }
+
+    /// Whether the drag is big enough to be a shot rather than a slip of the
+    /// hand. Same threshold the gesture has always used.
+    pub fn is_usable(&self) -> bool {
+        let (_, _, w, h) = self.rect();
+        w >= 8 && h >= 8
+    }
 }
 
 impl Global for AppState {}
@@ -76,6 +119,7 @@ impl AppState {
             config,
             settings: None,
             overlay: None,
+            capture_active: false,
             save_dialog: None,
             record_bar: None,
             pins: Vec::new(),
@@ -83,6 +127,7 @@ impl AppState {
             last_pin: None,
             hotkey_status: None,
             previous_foreground: 0,
+            drag: None,
         }
     }
 }
@@ -195,7 +240,9 @@ pub fn retire_window(title: &str, window: &mut Window) {
 
 /// Closes the capture session: the save window (if any) and the overlay.
 ///
-/// A save finishes the session, so both windows go together.
+/// A save finishes the session, so both windows go together. The overlay window
+/// itself is kept — it is hidden, not dropped, so the next capture does not have
+/// to build it again.
 pub fn close_capture(cx: &mut App) {
     crate::ui::save_dialog::close(cx);
     crate::ui::record_bar::close(cx);
@@ -204,12 +251,8 @@ pub fn close_capture(cx: &mut App) {
     util::release_capture();
     // Before the overlay goes: while we still own the foreground, give it back.
     restore_foreground(cx);
-    if let Some(handle) = state_mut(cx).overlay.take() {
-        let _ = handle.update(cx, |_, window, _| retire_window(OVERLAY_TITLE, window));
-    }
-    // Twice over: the window above may never have existed.
-    util::set_window_region(OVERLAY_TITLE, &[]);
-    util::hide_window(OVERLAY_TITLE);
+    state_mut(cx).drag = None;
+    hide_overlay(cx);
 }
 
 /// Closes just the save window, leaving the capture open to keep editing.
@@ -237,27 +280,19 @@ pub fn close_settings(cx: &mut App) {
 
 /// Handles a `截图` request from the hotkey or the tray menu.
 ///
-/// Two things are worth more than anything else here, because they are the only
-/// ones the user can feel: the pixels have to be grabbed, and a full-screen
-/// window with a Direct3D swapchain has to be built. They are independent, so
-/// they run at the same time — the grab starts on a worker thread and the window
-/// is built (hidden) while it is in flight. Measured on this machine, that takes
-/// the hotkey-to-visible walk from ~50 ms to ~33 ms.
+/// The press has to be answered immediately, and the two things standing in the
+/// way are the grab and the window. The grab runs on a worker thread; the window
+/// is *not built here at all* — there is one already, kept hidden between shots,
+/// because building it costs about 18 ms on this machine (measured; see
+/// `tools/probe_drag_latency.ps1`). What is left on the critical path is placing
+/// it, showing it, and the frame after that.
 pub fn trigger_capture(cx: &mut App) {
     // A scrolling shot or a recording has the screen to itself; a new overlay
     // dropped on top of one would end up in its own output.
-    if crate::capture::is_active() {
+    if crate::capture::is_active() || state(cx).capture_active {
         return;
     }
-    if state(cx).overlay.is_some() {
-        let handle = state(cx).overlay.unwrap();
-        if handle.update(cx, |_, _, _| {}).is_ok() {
-            // A selection is already in progress; a second F1 must not stack
-            // another overlay on top of it.
-            return;
-        }
-        state_mut(cx).overlay = None;
-    }
+    state_mut(cx).capture_active = true;
 
     // Synchronous and verified: by the time this returns the settings window is
     // off screen, so no guessed delay is needed before the capture.
@@ -268,23 +303,41 @@ pub fn trigger_capture(cx: &mut App) {
     // handed back when the capture ends.
     note_foreground(cx);
 
-    // Start the grab first, then spend the window build on top of it.
+    // Start the grab first: the window is up long before it lands.
     let started = std::time::Instant::now();
     let grabbed = cx.background_executor().spawn(async move {
         frame::capture_virtual_screen().map(|dib| {
             // The display image is built here too: it is a 14 MB copy, and the
-            // main thread has a window to create.
+            // main thread has a window to show.
             let image = dib.to_render_image();
             (dib, image)
         })
     });
 
     let screen = util::virtual_screen();
-    let Some(handle) = open_overlay_window(cx, screen) else {
-        eprintln!("xshot: could not open overlay");
+    let Some(handle) = ensure_overlay_window(cx, screen) else {
+        eprintln!("xshot: could not prepare the overlay");
+        state_mut(cx).capture_active = false;
+        state_mut(cx).drag = None;
         return;
     };
-    crate::timing("w overlay window built");
+    // This is the part the user feels: place it, arm it, show it. The window draws
+    // the dimming and the selection straight away, over the live desktop, and
+    // swaps in the frozen picture when the grab lands.
+    let drag = state(cx).drag;
+    if drag.is_some() {
+        // A Ctrl+drag reports itself through the mouse hook, and the press belongs
+        // to the window underneath — that window is running the drag. Taking the
+        // foreground would interrupt it, and a Chromium window activated in the
+        // middle of a drag takes the mouse and holds on to it.
+        win_util::set_no_activate(OVERLAY_TITLE, true);
+    }
+    let _ = handle.update(cx, |overlay, window, cx| {
+        overlay.begin_capture(drag.map(|drag| drag.rect()), cx);
+        window.refresh();
+    });
+    reveal_overlay(cx, screen, drag.is_none());
+    crate::timing("w overlay shown");
 
     cx.spawn(async move |cx| {
         let captured = grabbed.await;
@@ -294,20 +347,35 @@ pub fn trigger_capture(cx: &mut App) {
             Ok((dib, image)) => install_overlay(cx, handle, screen, dib, image),
             Err(error) => {
                 eprintln!("xshot: capture failed: {error:#}");
-                // The empty window must not be left behind.
-                let _ = handle.update(cx, |_, window, _| retire_window(OVERLAY_TITLE, window));
-                state_mut(cx).overlay = None;
+                // Nothing may be left on screen.
+                hide_overlay(cx);
+                state_mut(cx).drag = None;
             }
         });
     })
     .detach();
 }
 
-/// Builds the overlay window, hidden, over a placeholder frame.
+/// Builds the overlay window once, hidden, and keeps it.
 ///
-/// It stays invisible until [`install_overlay`] has both the real pixels and a
-/// drawn frame holding them, so the user never sees a half-built overlay.
-fn open_overlay_window(cx: &mut App, screen: VirtualScreen) -> Option<WindowHandle<Overlay>> {
+/// Building it is the single most expensive step of a capture on this machine
+/// (~18 ms: the window, its Direct3D swapchain and its first frame), and it does
+/// not depend on the screen at all. So it is built ahead of time — at startup,
+/// in the background — and every capture after that only has to place and show
+/// it.
+pub fn prepare_overlay(cx: &mut App) {
+    if state(cx).overlay.is_some() {
+        return;
+    }
+    let screen = util::virtual_screen();
+    let _ = ensure_overlay_window(cx, screen);
+}
+
+/// The overlay window, created if this is the first capture of the session.
+fn ensure_overlay_window(cx: &mut App, screen: VirtualScreen) -> Option<WindowHandle<Overlay>> {
+    if let Some(handle) = state(cx).overlay {
+        return Some(handle);
+    }
     let scale = estimate_scale(cx, screen);
     let logical_width = screen.w as f32 / scale;
     let logical_height = screen.h as f32 / scale;
@@ -327,12 +395,10 @@ fn open_overlay_window(cx: &mut App, screen: VirtualScreen) -> Option<WindowHand
         // taskbar and Alt+Tab, which is exactly what a selection overlay is.
         kind: WindowKind::PopUp,
         focus: false,
-        // Shown from the start, but transparent and drawing nothing until the
-        // capture lands: the user sees the desktop through it, so the window
-        // being built early costs nothing visually. A *hidden* window would be
-        // no good here — the platform frame loop never delivers it a frame, so
-        // it could not be filled in before being revealed.
-        show: true,
+        // Kept hidden between captures, and shown by `reveal_overlay`. It holds no
+        // pixels while it is hidden (`clear_source`), so what it would draw is
+        // nothing at all until a capture arms it.
+        show: false,
         is_resizable: false,
         is_movable: false,
         is_minimizable: false,
@@ -340,8 +406,7 @@ fn open_overlay_window(cx: &mut App, screen: VirtualScreen) -> Option<WindowHand
         ..Default::default()
     };
 
-    // A one-pixel frame. GDI hands back a zeroed section, so it is black, and
-    // the window is hidden anyway.
+    // A one-pixel frame, for the window to hold before its first capture.
     let placeholder = Dib::new(1, 1).ok()?;
     let origin = (screen.x, screen.y);
     let handle = cx
@@ -353,6 +418,41 @@ fn open_overlay_window(cx: &mut App, screen: VirtualScreen) -> Option<WindowHand
     Some(handle)
 }
 
+/// Puts the overlay on screen, sized for the virtual desktop.
+///
+/// Deliberately the cheap half of showing a window: place it (a no-op when it is
+/// already there, which it is after the first capture) and `ShowWindow`. Taking
+/// the foreground is a separate step, and one that a Ctrl+drag must not take —
+/// the press belongs to the window underneath, which is in the middle of a drag.
+fn reveal_overlay(_cx: &mut App, screen: VirtualScreen, take_foreground: bool) {
+    util::place_client_exact(OVERLAY_TITLE, screen.x, screen.y, screen.w, screen.h);
+    win_util::reveal_window(OVERLAY_TITLE);
+    if take_foreground {
+        if let Some(hwnd) = util::find_window(OVERLAY_TITLE) {
+            win_util::force_foreground(hwnd);
+        }
+    }
+    crate::timing("8 foreground");
+}
+
+/// Takes the overlay off the screen and forgets its pixels, keeping the window.
+///
+/// `hide_window_and_wait`, not `remove_window`: the window is reused, and hiding
+/// has to be past the compositor before anything photographs the screen.
+pub fn hide_overlay(cx: &mut App) {
+    state_mut(cx).capture_active = false;
+    if state(cx).overlay.is_none() {
+        return;
+    }
+    win_util::hide_window_and_wait(OVERLAY_TITLE, Duration::from_millis(200));
+    if let Some(handle) = state(cx).overlay {
+        let _ = handle.update(cx, |overlay, _, _| overlay.clear_source());
+    }
+    // A capture that came up without activation has to be reset, or the *next*
+    // one would not be able to take the foreground either.
+    win_util::set_no_activate(OVERLAY_TITLE, false);
+}
+
 /// Hands the freshly captured desktop to the window built for it and reveals it.
 fn install_overlay(
     cx: &mut App,
@@ -361,29 +461,53 @@ fn install_overlay(
     dib: Dib,
     image: Arc<RenderImage>,
 ) {
-    let (x, y, w, h) = (screen.x, screen.y, screen.w, screen.h);
-    // Fix the geometry before the frame is drawn, so what is presented matches
-    // the client area exactly.
-    if util::place_client_exact(OVERLAY_TITLE, x, y, w, h).is_none() {
-        let _ = handle.update(cx, |_, window, _| retire_window(OVERLAY_TITLE, window));
-        state_mut(cx).overlay = None;
+    let (x, y) = (screen.x, screen.y);
+    let drag = state(cx).drag;
+
+    // A Ctrl+drag can be over before the frozen desktop has landed — a flick of a
+    // gesture, or a press that never moved. There is nothing to show in that
+    // case, and no window to show it in: a usable rectangle is cropped straight
+    // out of the capture that is already in hand, and a press that never moved is
+    // dropped without pinning anything.
+    if let Some(drag) = drag.filter(|drag| drag.released) {
+        state_mut(cx).drag = None;
+        hide_overlay(cx);
+        crate::timing("d drag over before the window was ready");
+        if drag.is_usable() {
+            let (dx, dy, dw, dh) = drag.rect();
+            let left = (dx - x).clamp(0, dib.width - 1);
+            let top = (dy - y).clamp(0, dib.height - 1);
+            let width = dw.clamp(1, dib.width - left);
+            let height = dh.clamp(1, dib.height - top);
+            match dib.crop(left, top, width, height) {
+                Ok(output) => {
+                    let scale = estimate_scale(cx, screen);
+                    open_pin(
+                        cx,
+                        output,
+                        ((x + left) as f32 / scale, (y + top) as f32 / scale),
+                        scale,
+                    );
+                    crate::timing("d pinned");
+                }
+                Err(error) => eprintln!("xshot: Ctrl+drag crop failed: {error:#}"),
+            }
+        }
         return;
     }
-    crate::timing("6 placed");
 
+    // The window is already up (it was shown on the press, drawing the dimming and
+    // the selection): all that is missing is the pixels.
     let _ = handle.update(cx, |overlay, window, cx| {
         overlay.set_source(dib, (x as f32, y as f32), image);
+        // The rectangle the Ctrl+drag has drawn so far, in physical screen pixels.
+        if let Some(drag) = drag {
+            overlay.set_live_rect(Some(drag.rect()), cx);
+        }
         window.focus(&overlay.focus_handle(), cx);
-        // Hand the frozen desktop to the compositor before taking the
-        // foreground, so the overlay is never on screen without it.
         window.refresh();
     });
     crate::timing("7 painted");
-
-    if let Some(hwnd) = util::find_window(OVERLAY_TITLE) {
-        win_util::force_foreground(hwnd);
-    }
-    crate::timing("8 foreground");
 }
 
 /// Opens a borderless, always-on-top window holding a finished shot.
@@ -485,38 +609,101 @@ pub fn sync_global_input(cx: &App) {
     tray::set_ctrl_drag(config.ctrl_drag_pin);
 }
 
-/// Ctrl + left-drag: capture exactly what was dragged and pin it.
+/// Ctrl + left button went down: put the framing rectangle on screen.
 ///
-/// The rectangle comes from the mouse hook in physical screen pixels, so it is
-/// cropped straight out of a fresh capture — no overlay, no second gesture.
-pub fn capture_region_and_pin(cx: &mut App, x: i32, y: i32, w: i32, h: i32) {
-    // Our own window must not end up inside the shot.
-    win_util::hide_window_and_wait(SETTINGS_TITLE, Duration::from_millis(200));
+/// The press belongs to the window underneath — the hook only watches, so that
+/// Ctrl + left button went down: bring the screenshot window up on the drag.
+///
+/// The press itself belongs to the window underneath — the hook only watches, so
+/// that program runs its own drag, exactly as it would without us. What is added
+/// is the overlay: the screen is frozen on the press, and the selection follows
+/// the drag from the hook's reports. The window never takes the foreground, so
+/// the drag below is not interrupted.
+pub fn drag_begin(cx: &mut App, x: i32, y: i32) {
+    if crate::capture::is_active() || state(cx).capture_active {
+        crate::timing("d drag begin ignored");
+        return;
+    }
+    crate::timing("d drag begin");
+    state_mut(cx).drag = Some(LiveDrag {
+        start: (x, y),
+        current: (x, y),
+        released: false,
+    });
+    // The whole overlay, not a bare frame: the press is the moment the screen is
+    // frozen, so the picture the user frames is the picture they saw, and the
+    // tools are there if they want them. It has to come up on the *press*.
+    trigger_capture(cx);
+}
 
-    cx.spawn(async move |cx| {
-        let captured = cx
-            .background_executor()
-            .spawn(async move {
-                let screen = crate::win::util::virtual_screen();
-                let frame = frame::capture_virtual_screen()?;
-                let left = (x - screen.x).clamp(0, frame.width - 1);
-                let top = (y - screen.y).clamp(0, frame.height - 1);
-                let width = w.clamp(1, frame.width - left);
-                let height = h.clamp(1, frame.height - top);
-                frame.crop(left, top, width, height)
-            })
-            .await;
+/// The drag moved: redraw the selection in the overlay, if it is up yet.
+pub fn drag_update(cx: &mut App, x: i32, y: i32) {
+    let Some(mut drag) = state(cx).drag else {
+        return;
+    };
+    drag.current = (x, y);
+    state_mut(cx).drag = Some(drag);
+    draw_drag(cx);
+}
 
-        let _ = cx.update(|cx| match captured {
-            Ok(dib) => {
-                let scale = estimate_scale(cx, util::virtual_screen());
-                let origin = (x as f32 / scale, y as f32 / scale);
-                open_pin(cx, dib, origin, scale);
-            }
-            Err(error) => eprintln!("xshot: region capture failed: {error:#}"),
-        });
-    })
-    .detach();
+/// The button came up: pin what the drag drew — or, if it never moved, just
+/// close the overlay and pin nothing.
+pub fn drag_end(cx: &mut App, x: i32, y: i32) {
+    let Some(mut drag) = state(cx).drag else {
+        crate::timing("d drag end with no drag in flight");
+        return;
+    };
+    drag.current = (x, y);
+    drag.released = true;
+    state_mut(cx).drag = Some(drag);
+    crate::timing("d drag end");
+
+    // No window yet means the grab is still in flight; `install_overlay` takes it
+    // from there, out of the capture already in hand.
+    let Some(handle) = state(cx).overlay else {
+        return;
+    };
+    if !drag.is_usable() {
+        // A press that never moved: the gesture was a stray Ctrl+click, so the
+        // overlay goes away again without pinning anything.
+        crate::timing("d drag too small, closing without pinning");
+        let _ = handle.update(cx, |overlay, window, cx| overlay.cancel(window, cx));
+        return;
+    }
+    // Still holding its placeholder frame: there are no pixels in it to crop yet.
+    if !handle
+        .update(cx, |overlay, _, _| overlay.is_ready())
+        .unwrap_or(false)
+    {
+        return;
+    }
+    let _ = handle.update(cx, |overlay, window, cx| {
+        overlay.set_live_rect(Some(drag.rect()), cx);
+        overlay.finish_live_drag(window, cx);
+    });
+}
+
+/// Esc, or the other button, while a Ctrl+drag is still held: drop it.
+pub fn drag_cancel(cx: &mut App) {
+    if state_mut(cx).drag.take().is_none() {
+        return;
+    }
+    if let Some(handle) = state(cx).overlay {
+        let _ = handle.update(cx, |overlay, window, cx| overlay.cancel(window, cx));
+    }
+}
+
+/// Shows the drag's current rectangle in the overlay, when there is one.
+fn draw_drag(cx: &mut App) {
+    let Some(drag) = state(cx).drag else {
+        return;
+    };
+    let Some(handle) = state(cx).overlay else {
+        return;
+    };
+    let _ = handle.update(cx, |overlay, _, cx| {
+        overlay.set_live_rect(Some(drag.rect()), cx);
+    });
 }
 
 /// Brings back the shot that was pinned (and possibly closed) last.

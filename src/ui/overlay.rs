@@ -389,6 +389,18 @@ pub struct Overlay {
     /// While the frame is being dragged: where the cursor started, and where the
     /// selection was at that moment. Both in physical screen pixels.
     frame_drag: Option<((i32, i32), Rect)>,
+    /// Set while a Ctrl+drag is being drawn.
+    ///
+    /// The window is then *told* what to show — by the mouse hook, through the
+    /// app state — instead of being asked by a mouse event of its own: the press
+    /// belonged to the window underneath, and that window keeps the mouse for the
+    /// whole gesture. The tools are out of reach for the same reason, so they are
+    /// not drawn while this is set.
+    live_drag: bool,
+    /// Whether the frame that answers a press has been drawn yet. Only used to
+    /// time it (see `timing`), because that frame *is* the feedback the user
+    /// waits for.
+    answering: bool,
 }
 
 /// Which icon a toolbar button shows.
@@ -506,11 +518,94 @@ impl Overlay {
             frame_only: false,
             frame_locked: false,
             frame_drag: None,
+            live_drag: false,
+            answering: false,
         }
     }
 
     pub fn focus_handle(&self) -> FocusHandle {
         self.focus.clone()
+    }
+
+    /// Whether the real capture has landed yet. Until it has, this window holds
+    /// a one-pixel placeholder and can neither be drawn nor cropped.
+    pub fn is_ready(&self) -> bool {
+        self.ready
+    }
+
+    /// Arms this window for a capture whose pixels are not here yet.
+    ///
+    /// The window comes up before the grab lands and draws what it can without
+    /// pixels — the dimming and the selection — because that is what makes the
+    /// press feel answered. The frozen desktop follows a frame or two later, over
+    /// dimming that is already in place, so the change is barely visible.
+    pub fn begin_capture(&mut self, rect: Option<(i32, i32, i32, i32)>, cx: &mut Context<Self>) {
+        self.ready = false;
+        self.answering = true;
+        self.selection = None;
+        self.hover_rect = None;
+        self.selected_shape = None;
+        self.drag = None;
+        self.shapes.clear();
+        self.draft = None;
+        self.text = None;
+        self.tool = None;
+        self.magnifier = None;
+        self.frame_only = false;
+        self.frame_locked = false;
+        self.frame_drag = None;
+        self.live_drag = rect.is_some();
+        self.set_live_rect(rect, cx);
+    }
+
+    /// Gives the captured pixels back: nothing stale can be drawn, and the 14 MB
+    /// image is not held on to between shots.
+    ///
+    /// The frame size stays as it is — it is the screen, not the image, and the
+    /// window is sized from it.
+    pub fn clear_source(&mut self) {
+        self.ready = false;
+        self.live_drag = false;
+        self.selection = None;
+        self.magnifier = None;
+        self.pointer = None;
+        if let Ok(placeholder) = Dib::new(1, 1) {
+            self.source = placeholder;
+            self.image = self.source.to_render_image();
+        }
+    }
+
+    /// Draws the rectangle a Ctrl+drag has reached, in physical screen pixels.
+    ///
+    /// The gesture itself never arrives here: the press went to the window
+    /// underneath, which owns the drag and keeps the mouse until the button comes
+    /// up. So this window is told what to draw rather than asked.
+    pub fn set_live_rect(&mut self, rect: Option<(i32, i32, i32, i32)>, cx: &mut Context<Self>) {
+        let selection = rect.map(|(x, y, w, h)| {
+            Rect::new(
+                (x as f32 - self.screen_origin.0) / self.scale,
+                (y as f32 - self.screen_origin.1) / self.scale,
+                w as f32 / self.scale,
+                h as f32 / self.scale,
+            )
+        });
+        self.selection = selection;
+        // The loupe follows the corner the pointer is holding, exactly as it does
+        // for a hand-drawn selection — but it needs pixels, so not before the
+        // capture has landed.
+        if self.ready {
+            if let Some(selection) = selection {
+                self.pointer = Some(Pt::new(selection.right(), selection.bottom()));
+                self.refresh_magnifier();
+            }
+        }
+        cx.notify();
+    }
+
+    /// The Ctrl+drag's button came up: pin what it drew, and close.
+    pub fn finish_live_drag(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.live_drag = false;
+        self.finish(Finish::Pin, window, cx);
     }
 
     /// Installs a fresh capture into a window that was built ahead of it.
@@ -605,8 +700,7 @@ impl Overlay {
 
     /// Switches between normal framing and the stripped-down frame a session
     /// leaves on screen.
-    pub fn set_frame_only(&mut self, frame_only: bool) {
-        if self.frame_only == frame_only {
+    pub fn set_frame_only(&mut self, frame_only: bool) {        if self.frame_only == frame_only {
             return;
         }
         self.frame_only = frame_only;
@@ -1023,23 +1117,27 @@ impl Overlay {
     ///   up opening the context menu of the window behind;
     /// * GPUI took the mouse capture on that press, and only the matching
     ///   release gives it back;
-    /// * the window itself must be gone the moment this returns. `remove_window`
-    ///   alone is not enough: it is a request the toolkit drains on a later
-    ///   frame, and this window is often the last one the app has. A full-screen
-    ///   window that is still there while showing nothing is what makes clicks
-    ///   do nothing anywhere until another click happens to land on it.
-    fn end_session(&mut self, caller: &str, window: &mut Window, cx: &mut Context<Self>) {
+    /// * the window itself must be off screen the moment this returns. It is kept
+    ///   for the next capture, so `remove_window` is not the answer either way:
+    ///   [`crate::app::hide_overlay`] hides it through Win32 and waits for the
+    ///   compositor to drop the last frame, and empties it so nothing stale can be
+    ///   drawn. A full-screen window that is still there while showing nothing is
+    ///   what makes clicks do nothing anywhere until another click lands on it.
+    fn end_session(&mut self, caller: &str, _window: &mut Window, cx: &mut Context<Self>) {
         tray::swallow_next_button_up(caller);
         // GPUI took the capture on that press, and the release it needs is the
         // one we just arranged to eat. Hand the capture back here, or the next
         // click anywhere lands on a window that no longer exists.
         win_util::release_capture();
         app::restore_foreground(cx);
-        app::state_mut(cx).overlay = None;
-        app::retire_window(app::OVERLAY_TITLE, window);
+        app::state_mut(cx).drag = None;
+        self.live_drag = false;
+        // The window is hidden and emptied rather than dropped: it is reused for
+        // every capture, and building it is the most expensive step there is.
+        app::hide_overlay(cx);
     }
 
-    fn cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // The click that got here is still held down; its release has to be
         // eaten, or it lands on whatever window is behind and counts as a click
         // there — which is how a right click meant to cancel a screenshot ends
@@ -2208,7 +2306,7 @@ impl Overlay {
                         .child(if copied {
                             "已复制颜色值".to_string()
                         } else {
-                            "Shift 切换 HEX/RGB · C 复制".to_string()
+                            "Shift 切换 HEX/RGB  C 复制".to_string()
                         }),
                 )
                 .into_any_element(),
@@ -3088,6 +3186,12 @@ impl Render for Overlay {
             self.painted = true;
             crate::timing("6 overlay first paint");
         }
+        if self.answering {
+            // The frame that answers a press: the dimming and the selection, over
+            // the live desktop. This is the moment the user stops waiting.
+            self.answering = false;
+            crate::timing("p overlay answers the press");
+        }
         self.scale = window.scale_factor();
         let client = window.bounds().size;
         let (client_w, client_h) = (client.width.as_f32(), client.height.as_f32());
@@ -3132,8 +3236,12 @@ impl Render for Overlay {
                 .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up));
         }
 
-        root = root
-            .child(
+        // The frozen desktop is not here yet on the first frames of a capture: the
+        // window is up before the pixels are, drawing the dimming and the
+        // selection over the live desktop. That is the difference between "the
+        // press opened the window" and "the press did nothing for 40 ms".
+        if self.ready {
+            root = root.child(
                 img(self.image.clone())
                     .absolute()
                     .left_0()
@@ -3141,7 +3249,9 @@ impl Render for Overlay {
                     .w_full()
                     .h_full()
                     .object_fit(ObjectFit::Fill),
-            )
+            );
+        }
+        root = root
             .children(self.dim_mask())
             .child(self.vector_canvas())
             .children(self.mosaic_elements())
@@ -3184,8 +3294,10 @@ impl Render for Overlay {
         // handlers, so they are added here rather than with the rest of it.
         root = root.children(self.size_badge(cx)).children(self.radius_bar(cx));
 
-        if let Some(toolbar) = self.toolbar(cx) {
-            root = root.child(toolbar);
+        if !self.live_drag {
+            if let Some(toolbar) = self.toolbar(cx) {
+                root = root.child(toolbar);
+            }
         }
 
         root

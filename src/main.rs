@@ -138,6 +138,18 @@ fn main() {
                 .spawn(async { win::duplication::warm() })
                 .detach();
 
+            // The capture window is the other half of that walk: building it costs
+            // about 18 ms (the window, its Direct3D swapchain and its first frame),
+            // and none of it depends on the screen. Building it here means the
+            // first F1 — or the first Ctrl+drag — only has to place and show it.
+            cx.spawn(async move |cx| {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(150))
+                    .await;
+                let _ = cx.update(|cx| app::prepare_overlay(cx));
+            })
+            .detach();
+
             // The tray thread never touches the UI directly; it posts commands
             // here and this task wakes the moment one arrives.
             cx.spawn(async move |cx| {
@@ -151,9 +163,10 @@ fn main() {
                     }
                     cx.update(|cx| match command {
                         win::tray::Command::Capture => app::trigger_capture(cx),
-                        win::tray::Command::CaptureRegion { x, y, w, h } => {
-                            app::capture_region_and_pin(cx, x, y, w, h)
-                        }
+                        win::tray::Command::DragBegin { x, y } => app::drag_begin(cx, x, y),
+                        win::tray::Command::DragUpdate { x, y } => app::drag_update(cx, x, y),
+                        win::tray::Command::DragEnd { x, y } => app::drag_end(cx, x, y),
+                        win::tray::Command::DragCancel => app::drag_cancel(cx),
                         win::tray::Command::RestorePin => app::restore_last_pin(cx),
                         win::tray::Command::ShowSettings => app::open_settings(cx),
                         win::tray::Command::HotkeyStatus { capture, restore } => {

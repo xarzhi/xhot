@@ -32,9 +32,15 @@ use crate::win::icon;
 pub enum Command {
     /// Open the selection overlay.
     Capture,
-    /// Capture an exact rectangle, in physical screen pixels, and pin it. Sent
-    /// by the Ctrl+drag gesture.
-    CaptureRegion { x: i32, y: i32, w: i32, h: i32 },
+    /// Ctrl + left button went down here (physical screen pixels). The overlay
+    /// comes up straight away and follows the drag.
+    DragBegin { x: i32, y: i32 },
+    /// The drag moved to this point.
+    DragUpdate { x: i32, y: i32 },
+    /// The button came up here: pin what was dragged.
+    DragEnd { x: i32, y: i32 },
+    /// Esc while the button was still down: throw the drag away.
+    DragCancel,
     /// Re-open the most recently closed pinned shot.
     RestorePin,
     /// Show (or re-focus) the settings window.
@@ -78,6 +84,9 @@ static HOTKEY_CAPTURE: AtomicU32 = AtomicU32::new(0);
 static HOTKEY_RESTORE: AtomicU32 = AtomicU32::new(0);
 static CTRL_DRAG: AtomicBool = AtomicBool::new(false);
 static DRAG_START: Mutex<Option<(i32, i32)>> = Mutex::new(None);
+/// Where the drag was last reported from, so the UI is not flooded with one
+/// message per pixel of movement.
+static DRAG_SENT: Mutex<Option<(i32, i32)>> = Mutex::new(None);
 /// Set when a click closed one of our windows, so the release that follows is
 /// eaten instead of reaching the window underneath. See
 /// [`swallow_next_button_up`].
@@ -435,26 +444,54 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
 
         if code >= 0 && CTRL_DRAG.load(Ordering::SeqCst) {
             let info = &*(lparam.0 as *const MSLLHOOKSTRUCT);
+            let (x, y) = (info.pt.x, info.pt.y);
             match wparam.0 as u32 {
                 WM_LBUTTONDOWN => {
+                    // The press goes straight through to whatever is underneath —
+                    // this hook only watches — and the overlay comes up on it, so
+                    // the user sees the rectangle grow instead of finding out
+                    // after the fact.
                     let ctrl = GetAsyncKeyState(VK_CONTROL.0 as i32) < 0;
-                    let mut start = DRAG_START.lock().unwrap();
-                    *start = ctrl.then_some((info.pt.x, info.pt.y));
+                    let started = ctrl.then_some((x, y));
+                    if started.is_some() {
+                        *DRAG_SENT.lock().unwrap() = None;
+                        send(Command::DragBegin { x, y });
+                    }
+                    *DRAG_START.lock().unwrap() = started;
+                }
+                WM_MOUSEMOVE => {
+                    let start = *DRAG_START.lock().unwrap();
+                    if start.is_some() {
+                        // One message per two pixels: every one of them costs a
+                        // wake-up of the UI thread and a repaint.
+                        let sent = DRAG_SENT.lock().unwrap();
+                        let moved = match *sent {
+                            Some((last_x, last_y)) => {
+                                (x - last_x).abs() + (y - last_y).abs() >= 2
+                            }
+                            None => true,
+                        };
+                        drop(sent);
+                        if moved {
+                            *DRAG_SENT.lock().unwrap() = Some((x, y));
+                            send(Command::DragUpdate { x, y });
+                        }
+                    }
                 }
                 WM_LBUTTONUP => {
                     let start = DRAG_START.lock().unwrap().take();
-                    if let Some((x0, y0)) = start {
-                        let (x1, y1) = (info.pt.x, info.pt.y);
-                        let w = (x1 - x0).abs();
-                        let h = (y1 - y0).abs();
-                        if w >= 8 && h >= 8 {
-                            send(Command::CaptureRegion {
-                                x: x0.min(x1),
-                                y: y0.min(y1),
-                                w,
-                                h,
-                            });
-                        }
+                    *DRAG_SENT.lock().unwrap() = None;
+                    if start.is_some() {
+                        send(Command::DragEnd { x, y });
+                    }
+                }
+                WM_RBUTTONDOWN => {
+                    // The other button is the way out of a drag that is not
+                    // going anywhere.
+                    let start = DRAG_START.lock().unwrap().take();
+                    *DRAG_SENT.lock().unwrap() = None;
+                    if start.is_some() {
+                        send(Command::DragCancel);
                     }
                 }
                 _ => {}

@@ -340,35 +340,32 @@ fn end_session(cx: &mut App, restore_overlay: bool) {
     // use them again.
     set_overlay_frame_only(cx, false);
     if restore_overlay {
-        if app::state(cx).overlay.is_some() {
+        if app::state(cx).capture_active {
             win_util::show_window(app::OVERLAY_TITLE);
             if let Some(hwnd) = win_util::find_window(app::OVERLAY_TITLE) {
                 win_util::force_foreground(hwnd);
             }
         }
-    } else if let Some(handle) = app::state_mut(cx).overlay.take() {
+    } else if app::state(cx).capture_active {
         win_util::release_capture();
         // The session is over and the overlay is going: give the foreground back
-        // before the window that owns it is destroyed. See
+        // before the window that owns it is hidden. See
         // [`crate::win::util::restore_foreground`].
         app::restore_foreground(cx);
-        remove_overlay(cx, handle);
+        remove_overlay(cx);
     }
 }
 
-/// Takes the overlay off the screen, through Win32 first.
+/// Takes the overlay off the screen.
 ///
-/// `remove_window` only sets a flag that GPUI drains on a later frame, and this
-/// window is the one thing that must not outlive the session: by then its region
-/// has been given back — the whole screen again — while what it last painted is
-/// a bare frame over a transparent surface. A window in that state is invisible
-/// and eats every click on the desktop, and the only way out of it is a right
-/// click landing on the window itself to close it. [`crate::app::retire_window`]
-/// is that same order, for every window of ours that closes.
-fn remove_overlay(cx: &mut App, handle: gpui_kit::WindowHandle<crate::ui::overlay::Overlay>) {
-    let _ = handle.update(cx, |_, window, _| {
-        app::retire_window(app::OVERLAY_TITLE, window);
-    });
+/// The window itself is kept — it is hidden and emptied, not dropped, so the next
+/// capture only has to place and show it. `hide_window_and_wait` is what makes
+/// the hiding wait for the compositor: by the time a session ends the overlay's
+/// region is the whole screen again while what it last painted is a bare frame
+/// over the desktop, and a window in that state that is still on screen is
+/// invisible and eats every click on the desktop.
+fn remove_overlay(cx: &mut App) {
+    app::hide_overlay(cx);
 }
 
 /// Stops the frame from being dragged any more, once frames are being captured.

@@ -413,6 +413,15 @@ pub fn place_client_exact(title: &str, x: i32, y: i32, w: i32, h: i32) -> Option
         let mut origin = POINT { x: 0, y: 0 };
         let _ = ClientToScreen(hwnd, &mut origin);
 
+        // Already where it belongs: a `SetWindowPos` on a full-screen window costs
+        // about 11 ms (measured), and the capture window keeps its place between
+        // captures, so this is the common case on the walking path.
+        let client_w = client_rect.right - client_rect.left;
+        let client_h = client_rect.bottom - client_rect.top;
+        if (origin.x, origin.y) == (x, y) && (client_w, client_h) == (w, h) {
+            return Some(hwnd);
+        }
+
         let inset_left = origin.x - window_rect.left;
         let inset_top = origin.y - window_rect.top;
         let frame_width =
@@ -501,6 +510,18 @@ pub fn show_window(title: &str) -> bool {
     }
     force_foreground(hwnd);
     true
+}
+
+/// Shows a window without touching the foreground.
+///
+/// `ShowWindow` alone is about a millisecond; taking the foreground on top of it
+/// is an `AttachThreadInput` dance that costs several more, and a capture that
+/// began on somebody else's drag must not do it at all. This is the fast half.
+pub fn reveal_window(title: &str) -> bool {
+    let Some(hwnd) = find_window(title) else {
+        return false;
+    };
+    unsafe { ShowWindow(hwnd, SW_SHOW).as_bool() }
 }
 
 /// Hides a window and waits until Windows agrees it is off screen.
@@ -642,9 +663,8 @@ fn client_inset(hwnd: HWND) -> (i32, i32) {
 /// Sets or clears `WS_EX_NOACTIVATE`, so clicking a window never takes the
 /// foreground from the application underneath.
 ///
-/// Not reachable yet: only the recording toolbar wants this, and its button is
-/// not in the capture toolbar.
-#[allow(dead_code)]
+/// Used by the Ctrl+drag overlay: that window is shown while another window is
+/// in the middle of a drag, and taking activation would interrupt it.
 pub fn set_no_activate(title: &str, enabled: bool) -> bool {
     use windows::Win32::UI::WindowsAndMessaging::{
         GWL_EXSTYLE, GetWindowLongPtrW, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
@@ -679,8 +699,7 @@ pub fn set_no_activate(title: &str, enabled: bool) -> bool {
     }
 }
 
-/// Keeps a window out of screen captures, or lets it back in.
-///
+/// Keeps a window out of screen captures, or lets it back in.///
 /// `WDA_EXCLUDEFROMCAPTURE` is what Windows offers instead of the old
 /// "click through and hope `BitBlt` misses it" arrangement: `BitBlt` *does* see
 /// a DirectComposition window, so the recording toolbar has to be excluded
