@@ -201,6 +201,14 @@ struct Duplicator {
     /// This is what makes a capture of a still screen possible: duplication only
     /// reports what changed, so the parts nobody touched have to come from here.
     desktop: Option<Dib>,
+    /// Whether that copy holds a real picture yet.
+    ///
+    /// A duplication that has never handed out a frame leaves `desktop` as a
+    /// freshly allocated, all-zero bitmap, and answering a still screen with it
+    /// captures a *black* screen. Until the copy is primed — by a frame, or by
+    /// the GDI capture the caller falls back to — captures have to take the slow
+    /// path.
+    primed: bool,
 }
 
 impl Duplicator {
@@ -278,12 +286,17 @@ impl Duplicator {
                 context,
                 monitors,
                 desktop: None,
+                primed: false,
             })
         }
     }
 
     /// Takes what each monitor has changed, then hands the whole desktop over.
-    fn fill(&mut self, dib: &mut Dib) -> Result<()> {
+    ///
+    /// Returns whether the copy now holds a real picture. `false` means a fresh
+    /// duplicator that nobody has drawn on yet: the caller has to fill the frame
+    /// itself, and [`Self::adopt`] turns that into our copy.
+    fn fill(&mut self, dib: &mut Dib) -> Result<bool> {
         if self.desktop.is_none() {
             self.desktop = Some(Dib::new(dib.width, dib.height).context("desktop copy")?);
         }
@@ -291,10 +304,15 @@ impl Duplicator {
         // put back before returning, whatever happens.
         let mut desktop = self.desktop.take().expect("just ensured");
         let result = (|| {
+            let mut any = false;
             for monitor in &mut self.monitors {
-                monitor.refresh(&self.device, &self.context, &mut desktop)?;
+                any |= monitor.refresh(&self.device, &self.context, &mut desktop)?;
             }
-            dib.copy_from(&desktop)
+            self.primed |= any;
+            if self.primed {
+                dib.copy_from(&desktop)?;
+            }
+            Ok(self.primed)
         })();
         self.desktop = Some(desktop);
         result
@@ -304,11 +322,13 @@ impl Duplicator {
     ///
     /// Called once at startup: a screen nobody has touched since the duplication
     /// was created has no frames in it, and the copy has to come from somewhere.
+    #[allow(dead_code)]
     fn prime(&mut self) -> Result<()> {
         let screen = crate::win::util::virtual_screen();
         let mut desktop = Dib::new(screen.w, screen.h).context("desktop copy")?;
         crate::win::frame::bitblt_into(&mut desktop, screen.x, screen.y)?;
         self.desktop = Some(desktop);
+        self.primed = true;
         Ok(())
     }
 }
@@ -328,6 +348,10 @@ fn lock() -> std::sync::MutexGuard<'static, Option<Duplicator>> {
 /// milliseconds, and the first copy has to come from GDI — duplication starts
 /// with no frames at all — and neither belongs in the walk from the hotkey to a
 /// frozen screen, which is the one thing a user can feel.
+#[allow(dead_code)]
+/// Kept for the measurement test in rame.rs: the app itself builds the
+/// duplicator lazily inside [capture_into], on the first capture after an idle
+/// release, and primes it by adopting that capture's GDI fallback.
 pub fn warm() {
     let mut cached = lock();
     if cached.is_none() {
@@ -337,6 +361,21 @@ pub fn warm() {
         && let Err(error) = duplicator.prime()
     {
         crate::trace_log!("xshot: could not prime the desktop copy: {error:#}");
+    }
+}
+
+/// Gives the cached device and duplications back.
+///
+/// They are exactly what makes a capture fast — building them costs tens of
+/// milliseconds — but they also hold a Direct3D device plus one duplication per
+/// monitor, and they live for as long as the process does. An app that sits in the
+/// tray for hours between shots should not keep paying for that, so it is dropped
+/// once the app has been idle and rebuilt on the next capture.
+pub fn release() {
+    let mut cached = lock();
+    if cached.is_some() {
+        *cached = None;
+        crate::trace_log!("xshot: released the desktop duplicator while idle");
     }
 }
 
@@ -360,6 +399,9 @@ pub fn adopt(dib: &Dib) {
     } else if let Ok(copy) = dib.crop(0, 0, dib.width, dib.height) {
         duplicator.desktop = Some(copy);
     }
+    // Whatever it took, the copy now holds a picture GDI took: a capture of a
+    // still screen can be answered from it.
+    duplicator.primed = true;
 }
 
 /// Fills `dib` with the desktop. `false` means "ask GDI instead".
@@ -377,7 +419,10 @@ pub fn capture_into(dib: &mut Dib) -> bool {
         return false;
     };
     match duplicator.fill(dib) {
-        Ok(()) => true,
+        // `false` here is "the copy is still blank" — a duplicator built moments
+        // ago that nobody has drawn on yet. The caller's GDI path fills the frame
+        // and hands it back through `adopt`, which is what primes this one.
+        Ok(primed) => primed,
         Err(error) => {
             // Whatever went wrong is unlikely to be fixed by trying again with
             // the same objects; the next capture builds fresh ones.

@@ -38,7 +38,7 @@ fn icon_for(tool: Tool, color: Rgba) -> AnyElement {
         Tool::Eraser => glyph::RUBBER,
         Tool::Text => glyph::TEXT,
     };
-    icons::icon(art, 17.0, color)
+    icons::icon(art, 19.0, color)
 }
 
 const TOAST_LIFETIME: Duration = Duration::from_millis(1800);

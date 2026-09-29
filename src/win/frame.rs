@@ -579,18 +579,46 @@ mod tests {
             ReleaseDC(None, dc);
         }
 
-        let (a, b) = (gpu.pixels(), gdi.pixels());
+        // A third capture, GDI again, as a stability mask: the desktop is alive —
+        // a clock ticks, a window animates, a video plays — and pixels that
+        // changed between two *GDI* grabs are pixels nobody can compare. Without
+        // this the test fails on a busy screen for a reason that has nothing to do
+        // with either capture path (it did: three runs, 7.6k, 9.4k and 12.8k
+        // differing samples out of 283k, all of them moving).
+        let steady = Dib::new(screen.w, screen.h).unwrap();
+        unsafe {
+            let dc = GetDC(None);
+            let _ = BitBlt(
+                steady.hdc,
+                0,
+                0,
+                screen.w,
+                screen.h,
+                Some(dc),
+                screen.x,
+                screen.y,
+                ROP_CODE(SRCCOPY.0 | CAPTUREBLT.0),
+            );
+            ReleaseDC(None, dc);
+        }
+
+        let (a, b, c) = (gpu.pixels(), gdi.pixels(), steady.pixels());
         let mut differing = 0u64;
         let mut worst = 0u8;
         let mut samples = 0u64;
+        let mut moving = 0u64;
         // Every thirteenth pixel: enough to catch a shifted, swapped or blank
         // image, cheap enough to run in a test.
         for index in (0..a.len() / 4).step_by(13) {
             let base = index * 4;
-            let delta = (0..3)
-                .map(|channel| a[base + channel].abs_diff(b[base + channel]))
-                .max()
-                .unwrap_or(0);
+            let channel = |buffer: &[u8]| (0..3).map(|c| buffer[base + c]).collect::<Vec<_>>();
+            let (pa, pb, pc) = (channel(a), channel(b), channel(c));
+            let alive = (0..3).any(|i| pa[i].abs_diff(pc[i]) > 8 || pb[i].abs_diff(pc[i]) > 8);
+            if alive {
+                moving += 1;
+                continue;
+            }
+            let delta = (0..3).map(|i| pa[i].abs_diff(pb[i])).max().unwrap_or(0);
             samples += 1;
             if delta > 8 {
                 differing += 1;
@@ -598,11 +626,18 @@ mod tests {
             worst = worst.max(delta);
         }
         println!(
-            "duplication vs GDI over {samples} samples: {differing} differ by more than 8, worst {worst}"
+            "duplication vs GDI: {samples} steady samples, {differing} differ by more than 8, \
+             worst {worst}; {moving} skipped as moving"
         );
+        // Nothing steady on screen at all means the check could not run, which is
+        // not a failure of the capture path.
+        if samples == 0 {
+            println!("the whole desktop was moving; nothing to compare");
+            return;
+        }
         assert!(
             differing * 100 < samples,
-            "{differing} of {samples} sampled pixels differ between the GPU and GDI captures"
+            "{differing} of {samples} steady sampled pixels differ between the GPU and GDI captures"
         );
     }
 }

@@ -24,6 +24,7 @@ use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
 
+use crate::config::TrayClick;
 use crate::win::hotkey::Hotkey;
 use crate::win::icon;
 
@@ -83,6 +84,12 @@ static MOUSE_HOOK: AtomicIsize = AtomicIsize::new(0);
 static HOTKEY_CAPTURE: AtomicU32 = AtomicU32::new(0);
 static HOTKEY_RESTORE: AtomicU32 = AtomicU32::new(0);
 static CTRL_DRAG: AtomicBool = AtomicBool::new(false);
+/// What a single left click on the tray icon does (a [`TrayClick`], stored as
+/// `u32` because it is read on the tray thread).
+static TRAY_LEFT_CLICK: AtomicU32 = AtomicU32::new(TrayClick::Capture as u32);
+/// Set by a `WM_LBUTTONDBLCLK`, so the release that follows it does not fire the
+/// action a second time: one click, one action, whether or not it was a double.
+static TRAY_DOUBLE_CLICKED: AtomicBool = AtomicBool::new(false);
 static DRAG_START: Mutex<Option<(i32, i32)>> = Mutex::new(None);
 /// Where the drag was last reported from, so the UI is not flooded with one
 /// message per pixel of movement.
@@ -148,6 +155,14 @@ pub fn set_hotkeys(capture: Option<Hotkey>, restore: Option<Hotkey>) {
 /// Turns the Ctrl+drag capture gesture on or off.
 pub fn set_ctrl_drag(enabled: bool) {
     CTRL_DRAG.store(enabled, Ordering::SeqCst);
+}
+
+/// Sets what a single left click on the tray icon does.
+///
+/// A plain value rather than a channel: the tray thread reads it once per click,
+/// and the click itself is what wakes that thread.
+pub fn set_tray_left_click(action: TrayClick) {
+    TRAY_LEFT_CLICK.store(action as u32, Ordering::SeqCst);
 }
 
 /// Asks the tray thread to tear everything down and exit its message loop.
@@ -639,7 +654,20 @@ unsafe extern "system" fn window_proc(
                 let event = (lparam.0 as u32) & 0xFFFF;
                 match event {
                     WM_RBUTTONUP | WM_CONTEXTMENU => show_menu(hwnd),
-                    WM_LBUTTONDBLCLK => send(Command::Capture),
+                    // The action fires on the *release*, so a press that is dragged
+                    // off the icon does nothing — like every other shell button.
+                    WM_LBUTTONUP => {
+                        if !TRAY_DOUBLE_CLICKED.swap(false, Ordering::SeqCst) {
+                            // The second release of a double click is skipped: the
+                            // first one already did the work, and a double click
+                            // should not fire twice.
+                            match TrayClick::from_u32(TRAY_LEFT_CLICK.load(Ordering::SeqCst)) {
+                                TrayClick::Capture => send(Command::Capture),
+                                TrayClick::Settings => send(Command::ShowSettings),
+                            }
+                        }
+                    }
+                    WM_LBUTTONDBLCLK => TRAY_DOUBLE_CLICKED.store(true, Ordering::SeqCst),
                     _ => {}
                 }
                 LRESULT(0)

@@ -292,6 +292,13 @@ pub fn trigger_capture(cx: &mut App) {
     if crate::capture::is_active() || state(cx).capture_active {
         return;
     }
+    // A fullscreen window in the foreground is almost never what a screenshot is
+    // meant for, and the overlay would come up on a game or a film. The setting
+    // is on by default; the tray menu still has 截图 for the times it is wrong.
+    if state(cx).config.skip_when_fullscreen && win_util::foreground_is_fullscreen() {
+        crate::trace_log!("xshot: fullscreen window in the foreground; not capturing");
+        return;
+    }
     state_mut(cx).capture_active = true;
 
     // Synchronous and verified: by the time this returns the settings window is
@@ -356,32 +363,19 @@ pub fn trigger_capture(cx: &mut App) {
     .detach();
 }
 
-/// Builds the overlay window once, hidden, and keeps it.
-///
-/// Building it is the single most expensive step of a capture on this machine
-/// (~18 ms: the window, its Direct3D swapchain and its first frame), and it does
-/// not depend on the screen at all. So it is built ahead of time — at startup,
-/// in the background — and every capture after that only has to place and show
-/// it.
-pub fn prepare_overlay(cx: &mut App) {
-    if state(cx).overlay.is_some() {
-        return;
-    }
-    let screen = util::virtual_screen();
-    let _ = ensure_overlay_window(cx, screen);
-}
-
 /// The overlay window, created if this is the first capture of the session.
 fn ensure_overlay_window(cx: &mut App, screen: VirtualScreen) -> Option<WindowHandle<Overlay>> {
     if let Some(handle) = state(cx).overlay {
         return Some(handle);
     }
     let scale = estimate_scale(cx, screen);
-    let logical_width = screen.w as f32 / scale;
-    let logical_height = screen.h as f32 / scale;
+    // One pixel, not the whole desktop: this window lives for the whole session,
+    // and a full-screen one would hold a full-screen swapchain (tens of
+    // megabytes) while the app sits in the tray doing nothing. `reveal_overlay`
+    // sizes it to the desktop on the way in, and `hide_overlay` shrinks it back.
     let bounds = Bounds {
         origin: point(px(screen.x as f32 / scale), px(screen.y as f32 / scale)),
-        size: size(px(logical_width), px(logical_height)),
+        size: size(px(1.0), px(1.0)),
     };
 
     let options = WindowOptions {
@@ -395,10 +389,13 @@ fn ensure_overlay_window(cx: &mut App, screen: VirtualScreen) -> Option<WindowHa
         // taskbar and Alt+Tab, which is exactly what a selection overlay is.
         kind: WindowKind::PopUp,
         focus: false,
-        // Kept hidden between captures, and shown by `reveal_overlay`. It holds no
-        // pixels while it is hidden (`clear_source`), so what it would draw is
-        // nothing at all until a capture arms it.
-        show: false,
+        // Shown for the whole session, never hidden. A hidden window that is
+        // shown again presents whatever the compositor last kept for it, and for
+        // a reused capture window that is the previous shot: the old selection
+        // flashed on screen for a frame. Instead it is kept *empty* — nothing
+        // drawn, an empty region, one pixel — which is invisible, cannot be
+        // clicked, cannot be photographed, and costs no full-screen swapchain.
+        show: true,
         is_resizable: false,
         is_movable: false,
         is_minimizable: false,
@@ -415,16 +412,25 @@ fn ensure_overlay_window(cx: &mut App, screen: VirtualScreen) -> Option<WindowHa
         })
         .ok()?;
     state_mut(cx).overlay = Some(handle);
+    // Idle: never activated, and an empty region so that even the one pixel it
+    // occupies belongs to whatever is underneath.
+    win_util::set_no_activate(OVERLAY_TITLE, true);
+    util::set_window_region(OVERLAY_TITLE, &[(0, 0, 0, 0)]);
     Some(handle)
 }
 
 /// Puts the overlay on screen, sized for the virtual desktop.
 ///
-/// Deliberately the cheap half of showing a window: place it (a no-op when it is
-/// already there, which it is after the first capture) and `ShowWindow`. Taking
-/// the foreground is a separate step, and one that a Ctrl+drag must not take —
-/// the press belongs to the window underneath, which is in the middle of a drag.
+/// Deliberately the cheap half of showing a window: give it its area back,
+/// place it (a no-op when it is already there, which it is after the first
+/// capture) and `ShowWindow`. Taking the foreground is a separate step, and one
+/// that a Ctrl+drag must not take — the press belongs to the window underneath,
+/// which is in the middle of a drag.
 fn reveal_overlay(_cx: &mut App, screen: VirtualScreen, take_foreground: bool) {
+    // The idle state has an empty region, which is what keeps the window out of
+    // clicks and screenshots; its own area comes back before it is shown, so the
+    // first frame is already unclipped.
+    util::set_window_region(OVERLAY_TITLE, &[]);
     util::place_client_exact(OVERLAY_TITLE, screen.x, screen.y, screen.w, screen.h);
     win_util::reveal_window(OVERLAY_TITLE);
     if take_foreground {
@@ -435,22 +441,73 @@ fn reveal_overlay(_cx: &mut App, screen: VirtualScreen, take_foreground: bool) {
     crate::timing("8 foreground");
 }
 
-/// Takes the overlay off the screen and forgets its pixels, keeping the window.
+/// How long the app may sit unused before the things that only exist to make the
+/// next shot fast are handed back: the capture window's full-screen swapchain and
+/// the Direct3D device behind the desktop duplication. Tens of megabytes that a
+/// screenshot tool in the tray has no business holding while nobody is shooting.
+const IDLE_RELEASE: Duration = Duration::from_secs(20);
+
+/// Empties the overlay and, a moment later, takes it off the desktop entirely.
 ///
-/// `hide_window_and_wait`, not `remove_window`: the window is reused, and hiding
-/// has to be past the compositor before anything photographs the screen.
+/// The window is not hidden: hiding it would mean showing it again, and a window
+/// that is shown again presents the frame the compositor kept for it — the
+/// previous selection, flashing on the next shot. So it is left shown and made
+/// *empty* instead. A frame with nothing in it is painted first (that is the
+/// content the compositor will keep), and only then does the window get an empty
+/// region and a one-pixel size: no clicks, nothing to photograph, and no
+/// full-screen swapchain held while the app sits in the tray.
+///
+/// Long after that, the window and the duplicator are dropped altogether.
 pub fn hide_overlay(cx: &mut App) {
     state_mut(cx).capture_active = false;
     if state(cx).overlay.is_none() {
         return;
     }
-    win_util::hide_window_and_wait(OVERLAY_TITLE, Duration::from_millis(200));
     if let Some(handle) = state(cx).overlay {
-        let _ = handle.update(cx, |overlay, _, _| overlay.clear_source());
+        let _ = handle.update(cx, |overlay, window, cx| {
+            overlay.clear_source();
+            window.refresh();
+            cx.notify();
+        });
     }
     // A capture that came up without activation has to be reset, or the *next*
     // one would not be able to take the foreground either.
     win_util::set_no_activate(OVERLAY_TITLE, false);
+
+    cx.spawn(async move |cx| {
+        // Long enough for the empty frame to have been painted and presented.
+        cx.background_executor()
+            .timer(Duration::from_millis(150))
+            .await;
+        let _ = cx.update(|cx| {
+            if state(cx).capture_active || state(cx).overlay.is_none() {
+                return;
+            }
+            util::set_window_region(OVERLAY_TITLE, &[(0, 0, 0, 0)]);
+            util::resize_client(OVERLAY_TITLE, 1, 1);
+            // One frame at the new size, so the renderer actually gives its
+            // full-screen swapchain back instead of holding it for a window that
+            // is never drawn again.
+            if let Some(handle) = state(cx).overlay {
+                let _ = handle.update(cx, |_, window, cx| {
+                    window.refresh();
+                    cx.notify();
+                });
+            }
+        });
+
+        cx.background_executor().timer(IDLE_RELEASE).await;
+        let _ = cx.update(|cx| {
+            if state(cx).capture_active {
+                return;
+            }
+            if let Some(handle) = state_mut(cx).overlay.take() {
+                let _ = handle.update(cx, |_, window, _| retire_window(OVERLAY_TITLE, window));
+            }
+            crate::win::duplication::release();
+        });
+    })
+    .detach();
 }
 
 /// Hands the freshly captured desktop to the window built for it and reveals it.
@@ -607,6 +664,7 @@ pub fn sync_global_input(cx: &App) {
         crate::win::hotkey::parse(&config.hotkey_restore_pin),
     );
     tray::set_ctrl_drag(config.ctrl_drag_pin);
+    tray::set_tray_left_click(config.tray_left_click);
 }
 
 /// Ctrl + left button went down: put the framing rectangle on screen.
@@ -622,6 +680,12 @@ pub fn sync_global_input(cx: &App) {
 pub fn drag_begin(cx: &mut App, x: i32, y: i32) {
     if crate::capture::is_active() || state(cx).capture_active {
         crate::timing("d drag begin ignored");
+        return;
+    }
+    // Same rule as the hotkey: a Ctrl+drag over a fullscreen game drops both the
+    // overlay and the pin, and the drag in that window carries on untouched.
+    if state(cx).config.skip_when_fullscreen && win_util::foreground_is_fullscreen() {
+        crate::timing("d drag begin ignored: fullscreen");
         return;
     }
     crate::timing("d drag begin");

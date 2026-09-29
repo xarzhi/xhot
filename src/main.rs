@@ -73,8 +73,24 @@ fn icon_export_path() -> Option<String> {
     None
 }
 
+/// Whether the arguments ask for the version, as `xshot --version`.
+///
+/// The build-time answer, not a file's: it is the same `CARGO_PKG_VERSION` the
+/// settings window's about page and the executable's version resource show, so
+/// `xshot.exe --version` is the way to check a packaged build without opening it.
+fn wants_version() -> bool {
+    std::env::args()
+        .skip(1)
+        .any(|argument| argument == "--version" || argument == "-V")
+}
+
 fn main() {
     install_panic_log();
+
+    if wants_version() {
+        println!("xshot {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
 
     // Build-time utility: materialise the icon that is otherwise only ever drawn
     // at runtime, for the installer to embed. `xshot --export-icon assets/icon.ico`
@@ -107,6 +123,9 @@ fn main() {
     ) {
         eprintln!("xshot: tray thread failed to start: {error}");
     }
+    // The click action has no message of its own: the tray thread reads it when
+    // the icon is clicked.
+    win::tray::set_tray_left_click(configuration.tray_left_click);
 
     // GPUI's default quit mode on Windows is `LastWindowClosed`, which would
     // end the process the moment the settings window is closed — that is
@@ -129,26 +148,13 @@ fn main() {
                 app::open_settings(cx);
             }
 
-            // Get the capture path ready while nobody is waiting: building the
-            // Direct3D device and the per-monitor duplications takes tens of
-            // milliseconds and the first frame has to come from GDI, and both
-            // belong at startup rather than in the walk from the hotkey to a
-            // frozen screen.
-            cx.background_executor()
-                .spawn(async { win::duplication::warm() })
-                .detach();
-
-            // The capture window is the other half of that walk: building it costs
-            // about 18 ms (the window, its Direct3D swapchain and its first frame),
-            // and none of it depends on the screen. Building it here means the
-            // first F1 — or the first Ctrl+drag — only has to place and show it.
-            cx.spawn(async move |cx| {
-                cx.background_executor()
-                    .timer(std::time::Duration::from_millis(150))
-                    .await;
-                let _ = cx.update(|cx| app::prepare_overlay(cx));
-            })
-            .detach();
+            // Nothing is warmed here on purpose. The Direct3D device behind the
+            // desktop duplication and the capture window's swapchain together cost
+            // tens of megabytes, and a screenshot tool that sits in the tray
+            // should not be holding them while nobody is shooting. They are built
+            // on the first capture and released again after a stretch of idleness
+            // (see `app::hide_overlay`), which keeps a burst of shots fast without
+            // paying for the burst all day.
 
             // The tray thread never touches the UI directly; it posts commands
             // here and this task wakes the moment one arrives.

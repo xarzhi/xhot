@@ -405,6 +405,7 @@ pub fn system_uses_light_theme() -> bool {
 /// pixel-exact overlay.
 pub fn place_client_exact(title: &str, x: i32, y: i32, w: i32, h: i32) -> Option<HWND> {
     let hwnd = find_window(title)?;
+
     unsafe {
         let mut window_rect = RECT::default();
         let mut client_rect = RECT::default();
@@ -442,6 +443,40 @@ pub fn place_client_exact(title: &str, x: i32, y: i32, w: i32, h: i32) -> Option
     Some(hwnd)
 }
 
+/// Resizes a window's client area without showing or moving it.
+///
+/// Used to shrink the capture window while it is hidden, between shots: a window
+/// that has a full-screen swapchain keeps those surfaces (tens of megabytes)
+/// alive, and — more visibly — a hidden window that is shown again presents the
+/// *last frame it painted* until the new one arrives, which for a reused capture
+/// window is the previous selection flashing on screen.
+pub fn resize_client(title: &str, w: i32, h: i32) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER};
+    let Some(hwnd) = find_window(title) else {
+        return false;
+    };
+    unsafe {
+        let mut window_rect = RECT::default();
+        let mut client_rect = RECT::default();
+        let _ = GetWindowRect(hwnd, &mut window_rect);
+        let _ = GetClientRect(hwnd, &mut client_rect);
+        let frame_width =
+            (window_rect.right - window_rect.left) - (client_rect.right - client_rect.left);
+        let frame_height =
+            (window_rect.bottom - window_rect.top) - (client_rect.bottom - client_rect.top);
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            w + frame_width,
+            h + frame_height,
+            SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOZORDER,
+        );
+    }
+    true
+}
+
 /// Where a window's client area currently starts, in physical screen pixels.
 pub fn client_origin(title: &str) -> Option<(i32, i32)> {
     let hwnd = find_window(title)?;
@@ -451,6 +486,7 @@ pub fn client_origin(title: &str) -> Option<(i32, i32)> {
     }
     Some((origin.x, origin.y))
 }
+
 
 /// Turns the desktop-compositor drop shadow on or off for a window.
 ///
@@ -480,7 +516,6 @@ pub fn set_window_shadow(title: &str, enabled: bool) -> bool {
         .is_ok()
     }
 }
-
 /// Whether a top-level window with this title is currently on screen.
 pub fn is_window_visible(title: &str) -> bool {    find_window(title)
         .map(|hwnd| unsafe { IsWindowVisible(hwnd).as_bool() })
@@ -696,6 +731,85 @@ pub fn set_no_activate(title: &str, enabled: bool) -> bool {
             SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER,
         );
         true
+    }
+}
+
+
+/// Whether the foreground window is a fullscreen window — a game, a video, a
+/// presentation — rather than an ordinary window that happens to be large.
+///
+/// The test is the *client* area against the monitor's own rectangle, not the
+/// window's: a maximised window fills the work area, which stops short of the
+/// taskbar, so it correctly does not count. The shell is excluded by class, too —
+/// the desktop and the taskbar do cover a whole monitor, and neither is an
+/// application the user is "in".
+pub fn foreground_is_fullscreen() -> bool {
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+    };
+    use windows::Win32::System::Threading::GetCurrentProcessId;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetClassNameW, GetClientRect, GetForegroundWindow, GetWindowThreadProcessId,
+        IsIconic,
+    };
+
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.is_invalid() {
+            return false;
+        }
+        // Our own windows are never the reason to skip: the overlay takes the
+        // foreground itself while a capture is running.
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if pid == GetCurrentProcessId() {
+            return false;
+        }
+        // The shell covers monitors without being an application.
+        let mut class = [0u16; 64];
+        let length = GetClassNameW(hwnd, &mut class);
+        if length > 0 {
+            let name = String::from_utf16_lossy(&class[..length as usize]);
+            if matches!(
+                name.as_str(),
+                "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd"
+            ) {
+                return false;
+            }
+        }
+        // A minimised window has no meaningful rectangle.
+        if IsIconic(hwnd).as_bool() {
+            return false;
+        }
+
+        let mut client = RECT::default();
+        if GetClientRect(hwnd, &mut client).is_err() {
+            return false;
+        }
+        let mut origin = POINT { x: 0, y: 0 };
+        if !ClientToScreen(hwnd, &mut origin).as_bool() {
+            return false;
+        }
+        let mut monitor = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut monitor)
+            .as_bool()
+        {
+            return false;
+        }
+
+        let screen = monitor.rcMonitor;
+        let (left, top) = (origin.x, origin.y);
+        let (right, bottom) = (left + (client.right - client.left), top + (client.bottom - client.top));
+        // A couple of pixels of slack either way: a fullscreen window's client is
+        // the monitor exactly, and nothing legitimate is off by more than that.
+        const SLACK: i32 = 2;
+        (left - screen.left).abs() <= SLACK
+            && (top - screen.top).abs() <= SLACK
+            && (right - screen.right).abs() <= SLACK
+            && (bottom - screen.bottom).abs() <= SLACK
     }
 }
 

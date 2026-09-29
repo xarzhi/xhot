@@ -8,8 +8,20 @@
 
 use gpui_kit::*;
 
+// The dropdown is the kit's own widget, not ours and not a raw primitive:
+// `gpui_kit::component` is gpui-component, the styled component library that
+// ships with the kit, and its `Select` comes with the trigger, the list, the
+// caret, the check marks, the keyboard and the accessibility built in.
+use gpui_kit::component::{
+    IndexPath, Theme as ComponentTheme, ThemeMode,
+    select::{Select as ComponentSelect, SelectEvent, SelectState, SearchableVec},
+};
+
 use crate::app;
-use crate::config::{CloseBehavior, FinishAction, ThemeChoice};
+use std::path::PathBuf;
+
+use crate::config::{CloseBehavior, FinishAction, ThemeChoice, TrayClick};
+use crate::win::util as win_util;
 use crate::ui::icons::{self, glyph};
 use crate::ui::theme::{
     CONTROL_HEIGHT, FONT_FAMILY, NAV_ROW_HEIGHT, RADIUS_CARD, RADIUS_CONTROL, TEXT_BODY,
@@ -24,14 +36,16 @@ enum Page {
     Appearance,
     Screenshot,
     Shortcuts,
+    About,
 }
 
 impl Page {
-    const ALL: [Page; 4] = [
+    const ALL: [Page; 5] = [
         Page::General,
         Page::Appearance,
         Page::Screenshot,
         Page::Shortcuts,
+        Page::About,
     ];
 
     fn label(self) -> &'static str {
@@ -40,6 +54,7 @@ impl Page {
             Page::Appearance => "外观设置",
             Page::Screenshot => "截图设置",
             Page::Shortcuts => "快捷键设置",
+            Page::About => "关于",
         }
     }
 
@@ -49,6 +64,7 @@ impl Page {
             Page::Appearance => "🎨",
             Page::Screenshot => "✂",
             Page::Shortcuts => "⌨",
+            Page::About => "ℹ",
         }
     }
 }
@@ -59,6 +75,184 @@ enum Recording {
     None,
     Capture,
     Restore,
+}
+
+/// One of the settings that is picked from a list.
+///
+/// Every choice setting in this window is one of these, so they all share the same
+/// dropdown: the labels its list shows, which one is in force, and what applying it
+/// means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Select {
+    /// What closing the settings window does.
+    CloseBehavior,
+    /// What a single left click on the tray icon does.
+    TrayClick,
+    /// Where 保存 starts.
+    SaveDir,
+    Theme,
+    /// What Enter, double-click and 完成 produce.
+    FinishAction,
+    /// How dark everything outside the selection is.
+    Dim,
+}
+
+impl Select {
+    /// Every dropdown in the window, in the order their focus handles are kept.
+    const ALL: [Select; 6] = [
+        Select::CloseBehavior,
+        Select::TrayClick,
+        Select::SaveDir,
+        Select::Theme,
+        Select::FinishAction,
+        Select::Dim,
+    ];
+
+    /// How many dropdowns there are.
+    const COUNT: usize = Self::ALL.len();
+
+    /// The labels its list shows, and which of them is the value in force.
+    ///
+    /// `None` means "nothing in the list is in force", which is a real case for
+    /// the save folder: the configured one is usually not one of the four
+    /// offered, and then the dropdown shows it as a placeholder instead of
+    /// pretending one of the four is selected.
+    fn options(self, cx: &App) -> (Vec<String>, Option<usize>) {
+        let config = &app::state(cx).config;
+        match self {
+            Self::CloseBehavior => (
+                CloseBehavior::ALL.iter().map(|o| o.label().to_string()).collect(),
+                CloseBehavior::ALL
+                    .iter()
+                    .position(|o| *o == config.close_behavior),
+            ),
+            Self::TrayClick => (
+                TrayClick::ALL.iter().map(|o| o.label().to_string()).collect(),
+                TrayClick::ALL
+                    .iter()
+                    .position(|o| *o == config.tray_left_click),
+            ),
+            Self::Theme => (
+                ThemeChoice::ALL.iter().map(|o| o.label().to_string()).collect(),
+                ThemeChoice::ALL
+                    .iter()
+                    .position(|o| *o == config.theme),
+            ),
+            Self::FinishAction => (
+                FinishAction::ALL.iter().map(|o| o.label().to_string()).collect(),
+                FinishAction::ALL
+                    .iter()
+                    .position(|o| *o == config.finish_action),
+            ),
+            Self::Dim => (
+                DIM_LEVELS.iter().map(|(_, label)| (*label).to_string()).collect(),
+                DIM_LEVELS
+                    .iter()
+                    .position(|(value, _)| (value - config.dim_strength).abs() < 0.01),
+            ),
+            Self::SaveDir => {
+                let dirs = save_dir_choices();
+                let index = dirs
+                    .iter()
+                    .position(|(_, path)| *path == config.save_dir);
+                let mut labels: Vec<String> = dirs.into_iter().map(|(label, _)| label).collect();
+                labels.push("浏览…".into());
+                (labels, index)
+            }
+        }
+    }
+
+    /// What the dropdown shows when nothing in its list is in force.
+    fn placeholder(self, cx: &App) -> Option<String> {
+        let (_, index) = self.options(cx);
+        if index.is_some() {
+            return None;
+        }
+        // Only the save folder can be outside its list; name it rather than
+        // pretend one of the four is in force.
+        (self == Self::SaveDir).then(|| app::state(cx).config.save_dir.display().to_string())
+    }
+
+    /// The one-line explanation shown under the dropdown, for the value in force.
+    fn hint(self, cx: &App) -> Option<&'static str> {
+        let (_, index) = self.options(cx);
+        let index = index?;
+        match self {
+            Self::CloseBehavior => CloseBehavior::ALL.get(index).map(|o| o.hint()),
+            Self::TrayClick => TrayClick::ALL.get(index).map(|o| o.hint()),
+            _ => None,
+        }
+    }
+
+    /// Applies the row at `index`.
+    fn apply(self, index: usize, cx: &mut App) {
+        match self {
+            Self::CloseBehavior => {
+                if let Some(option) = CloseBehavior::ALL.get(index) {
+                    app::update_config(cx, |config| config.close_behavior = *option);
+                }
+            }
+            Self::TrayClick => {
+                if let Some(option) = TrayClick::ALL.get(index) {
+                    app::update_config(cx, |config| config.tray_left_click = *option);
+                }
+            }
+            Self::Theme => {
+                if let Some(option) = ThemeChoice::ALL.get(index) {
+                    app::update_config(cx, |config| config.theme = *option);
+                }
+            }
+            Self::FinishAction => {
+                if let Some(option) = FinishAction::ALL.get(index) {
+                    app::update_config(cx, |config| config.finish_action = *option);
+                }
+            }
+            Self::Dim => {
+                if let Some((value, _)) = DIM_LEVELS.get(index) {
+                    app::update_config(cx, |config| config.dim_strength = *value);
+                }
+            }
+            Self::SaveDir => {
+                let dirs = save_dir_choices();
+                if let Some((_, path)) = dirs.get(index) {
+                    let path = path.clone();
+                    app::update_config(cx, |config| config.save_dir = path);
+                } else {
+                    // The last row: ask the user for a folder.
+                    let start = app::state(cx).config.save_dir.clone();
+                    if let Some(picked) = win_util::pick_folder(&start) {
+                        app::update_config(cx, |config| config.save_dir = picked);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// How dark everything outside the selection is, and what to call each level.
+const DIM_LEVELS: [(f32, &str); 3] = [(0.2, "浅"), (0.42, "中"), (0.62, "深")];
+
+/// Width of a dropdown trigger, in logical pixels. The widget sizes itself; this
+/// only keeps the right-hand column of every card the same width.
+const DROPDOWN_WIDTH: f32 = 180.0;
+
+/// The folders offered for 保存, as (label, path).
+///
+/// The physical `%USERPROFILE%` paths rather than the shell's display names: those
+/// are localised, these are not.
+fn save_dir_choices() -> Vec<(String, PathBuf)> {
+    let Some(home) = std::env::var_os("USERPROFILE").map(PathBuf::from) else {
+        return Vec::new();
+    };
+    [
+        ("桌面", "Desktop"),
+        ("图片", "Pictures"),
+        ("下载", "Downloads"),
+        ("文档", "Documents"),
+    ]
+    .into_iter()
+    .map(|(label, folder)| (label.to_string(), home.join(folder)))
+    .collect()
 }
 
 pub struct Settings {
@@ -76,7 +270,16 @@ pub struct Settings {
     pending_modifiers: Modifiers,
     /// Title-bar drag in progress: the cursor and window origin at press time.
     dragging: Option<((i32, i32), (i32, i32))>,
+    /// One `Select` state per choice setting, in `Select::ALL` order.
+    ///
+    /// gpui-component's dropdown keeps its own open state, its list, its cursor
+    /// and its search box; the view only keeps the entity and subscribes to what
+    /// the user confirms.
+    selects: [Entity<SelectState<SelectList>>; Select::COUNT],
 }
+
+/// The item type the dropdowns are built from: a plain list of labels.
+type SelectList = SearchableVec<String>;
 
 impl Settings {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -84,6 +287,36 @@ impl Settings {
         // without the user having to click first.
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
+
+        // Each dropdown is a state entity of its own, built from the labels of
+        // its `Select` and seeded with the value in force. The subscription is
+        // what turns a confirmed row into a configuration change; it lives on the
+        // view, so it goes away with the window.
+        let selects: [Entity<SelectState<SelectList>>; Select::COUNT] =
+            std::array::from_fn(|index| {
+                let select = Select::ALL[index];
+                let (labels, selected) = select.options(cx);
+                let selected = selected.map(IndexPath::new);
+                cx.new(|cx| SelectState::new(SearchableVec::new(labels), selected, window, cx))
+            });
+        for (index, state) in selects.iter().enumerate() {
+            let select = Select::ALL[index];
+            cx.subscribe(state, move |_settings, _state, event: &SelectEvent<SelectList>, cx| {
+                // Only a confirmed row changes anything: dismissing the list
+                // leaves the value alone, which is what Escape should mean.
+                let SelectEvent::Confirm(value) = event;
+                let Some(value) = value else {
+                    return;
+                };
+                let (labels, _) = select.options(cx);
+                if let Some(row) = labels.iter().position(|label| label == value) {
+                    select.apply(row, cx);
+                    cx.notify();
+                }
+            })
+            .detach();
+        }
+
         Self {
             focus,
             page: Page::General,
@@ -91,6 +324,7 @@ impl Settings {
             recording: Recording::None,
             pending_modifiers: Modifiers::default(),
             dragging: None,
+            selects,
         }
     }
 
@@ -220,13 +454,27 @@ impl Render for Settings {
         let theme = config.resolved_theme();
         let page = self.page;
 
+        // gpui-component carries a theme of its own, and its widgets are painted
+        // from it. Left alone it follows the system, which would put a light
+        // dropdown in a dark window whenever the two disagree; this keeps it in
+        // step with the palette the rest of the window is drawn in.
+        let mode = if theme.is_dark {
+            ThemeMode::Dark
+        } else {
+            ThemeMode::Light
+        };
+        if ComponentTheme::global(cx).mode != mode {
+            ComponentTheme::change(mode, Some(window), cx);
+        }
+
         let title_bar = self.title_bar(window, theme, cx);
         let sidebar = self.sidebar(theme, cx);
         let body = match page {
-            Page::General => general_page(&config, theme, cx),
-            Page::Appearance => appearance_page(&config, theme, cx),
-            Page::Screenshot => screenshot_page(&config, theme, cx),
+            Page::General => general_page(self, &config, theme, cx),
+            Page::Appearance => appearance_page(self, &config, theme, cx),
+            Page::Screenshot => screenshot_page(self, &config, theme, cx),
             Page::Shortcuts => shortcuts_page(self, &config, theme, cx),
+            Page::About => about_page(theme, cx),
         };
 
         div()
@@ -447,38 +695,8 @@ fn caption(text: String, theme: Theme) -> AnyElement {
         .into_any_element()
 }
 
-fn general_page(config: &crate::config::Config, theme: Theme, cx: &mut Context<Settings>) -> AnyElement {
-    let behavior = config.close_behavior;
+fn general_page(state: &Settings, config: &crate::config::Config, theme: Theme, cx: &mut Context<Settings>) -> AnyElement {
     let save_dir = config.save_dir.display().to_string();
-
-    let behavior_choices: Vec<AnyElement> = CloseBehavior::ALL
-        .into_iter()
-        .map(|option| {
-            let active = option == behavior;
-            div()
-                .id(option.label())
-                .flex()
-                .flex_col()
-                .gap(px(2.0))
-                .flex_1()
-                .p(px(12.0))
-                .rounded(px(RADIUS_CONTROL))
-                .cursor_pointer()
-                .bg(if active { theme.card_hover } else { theme.subtle_pressed })
-                .border_1()
-                .border_color(if active { theme.accent } else { theme.stroke })
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |_this, _event, _window, cx| {
-                        app::update_config(cx, |config| config.close_behavior = option);
-                        cx.notify();
-                    }),
-                )
-                .child(div().child(option.label()))
-                .child(caption(option.hint().into(), theme))
-                .into_any_element()
-        })
-        .collect();
 
     div()
         .flex()
@@ -486,13 +704,14 @@ fn general_page(config: &crate::config::Config, theme: Theme, cx: &mut Context<S
         .gap(px(12.0))
         .child(
             card(theme)
-                .child(div().child("关闭设置窗口时"))
-                .child(div().flex().flex_row().gap(px(10.0)).children(behavior_choices)),
+                .child(div().child("窗口关闭行为"))
+                .child(setting_row_dropdown(state, Select::CloseBehavior, "关闭设置窗口时", theme, cx)),
         )
         .child(
             card(theme)
                 .child(div().child("截图保存目录"))
-                .child(caption(save_dir, theme))
+                .child(setting_row_dropdown(state, Select::SaveDir, "保存到", theme, cx))
+                .child(caption(format!("当前：{save_dir}"), theme))
                 .child(
                     div()
                         .flex()
@@ -545,18 +764,21 @@ fn general_page(config: &crate::config::Config, theme: Theme, cx: &mut Context<S
                     theme,
                     cx,
                     |config| config.silent_start = !config.silent_start,
-                )),
+                ))
+                .child(setting_row_dropdown(state, Select::TrayClick, "左键点击托盘图标", theme, cx)),
         )
         .child(
             card(theme)
-                .child(div().child("完成后同时复制到剪贴板"))
-                .child(caption(
-                    "关闭后，保存或钉图不会顺带写入剪贴板".into(),
+                .child(div().child("截图"))
+                .child(setting_row(
+                    "全屏窗口时不截图",
+                    "前台窗口铺满整个显示器时（游戏、视频、演示），快捷键和 Ctrl+拖动都不响应",
+                    config.skip_when_fullscreen,
+                    "fullscreen-toggle",
                     theme,
-                ))
-                .child(toggle(config.copy_on_finish, "copy-toggle", theme, cx, |config| {
-                    config.copy_on_finish = !config.copy_on_finish;
-                })),
+                    cx,
+                    |config| config.skip_when_fullscreen = !config.skip_when_fullscreen,
+                )),
         )
         .into_any_element()
 }
@@ -629,57 +851,66 @@ fn setting_row(
         .into_any_element()
 }
 
-fn appearance_page(config: &crate::config::Config, theme: Theme, cx: &mut Context<Settings>) -> AnyElement {
-    let choice = config.theme;
-    let chooser: Vec<AnyElement> = ThemeChoice::ALL
-        .into_iter()
-        .map(|option| {
-            let active = option == choice;
+/// One "label on the left, dropdown on the right" settings row.
+///
+/// The dropdown is gpui-component's `Select` — the styled widget from the kit
+/// (`gpui_kit::component`) — which brings its own trigger, list, caret, check
+/// marks, keyboard handling and accessibility. What is left here is the label
+/// beside it and the width it takes.
+///
+/// The widget owns its state: the view builds one [`SelectState`] per choice
+/// setting in [`Settings::new`] (that is also where a confirmed row becomes a
+/// configuration change) and hands the entity to the widget here.
+fn setting_row_dropdown(
+    state: &Settings,
+    select: Select,
+    title: &'static str,
+    theme: Theme,
+    cx: &mut Context<Settings>,
+) -> AnyElement {
+    let mut column = div()
+        .flex()
+        .flex_col()
+        .gap(px(2.0))
+        .flex_1()
+        .child(
             div()
-                .id(option.label())
-                .flex()
-                .items_center()
-                .justify_center()
-                .h(px(CONTROL_HEIGHT))
-                .px(px(16.0))
-                .rounded(px(RADIUS_CONTROL))
-                .cursor_pointer()
-                .bg(if active { theme.accent } else { theme.subtle_pressed })
-                .text_color(if active { theme.on_accent } else { theme.text })
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |_this, _event, _window, cx| {
-                        app::update_config(cx, |config| config.theme = option);
-                        cx.notify();
-                    }),
-                )
-                .child(option.label())
-                .into_any_element()
-        })
-        .collect();
+                .text_size(px(TEXT_BODY))
+                .text_color(theme.text)
+                .child(title),
+        );
+    if let Some(hint) = select.hint(cx) {
+        column = column.child(caption(hint.into(), theme));
+    }
 
-    // A row of swatches makes the active palette visible without a preview pane.
-    let swatches: Vec<AnyElement> = [
-        theme.accent,
-        theme.card,
-        theme.window,
-        theme.stroke_strong,
-        theme.text,
-        theme.danger,
-    ]
-    .into_iter()
-    .map(|color| {
-        div()
-            .w(px(40.0))
-            .h(px(40.0))
-            .rounded(px(RADIUS_CONTROL))
-            .bg(color)
-            .border_1()
-            .border_color(theme.stroke)
-            .into_any_element()
-    })
-    .collect();
+    let mut dropdown = ComponentSelect::new(&state.selects[select as usize])
+        .accessibility_label(title)
+        .w(px(DROPDOWN_WIDTH));
+    // Only the save folder can be something the list does not offer; then the
+    // widget shows it as its placeholder instead of a wrong row.
+    if let Some(placeholder) = select.placeholder(cx) {
+        dropdown = dropdown.placeholder(placeholder);
+    }
 
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .gap(px(12.0))
+        .child(column)
+        // The widget's own root is `size_full`, so it is given a box of its own:
+        // otherwise it would fill the row and leave the trigger sitting against
+        // the label instead of at the right-hand edge every other control uses.
+        .child(
+            div()
+                .flex_shrink_0()
+                .w(px(DROPDOWN_WIDTH))
+                .child(dropdown),
+        )
+        .into_any_element()
+}
+fn appearance_page(state: &Settings, config: &crate::config::Config, theme: Theme, cx: &mut Context<Settings>) -> AnyElement {
     div()
         .flex()
         .flex_col()
@@ -688,12 +919,7 @@ fn appearance_page(config: &crate::config::Config, theme: Theme, cx: &mut Contex
             card(theme)
                 .child(div().child("主题"))
                 .child(caption("设置窗口与右键菜单使用的配色".into(), theme))
-                .child(div().flex().flex_row().gap(px(8.0)).children(chooser)),
-        )
-        .child(
-            card(theme)
-                .child(div().child("当前配色"))
-                .child(div().flex().flex_row().gap(px(8.0)).children(swatches)),
+                .child(setting_row_dropdown(state, Select::Theme, "配色", theme, cx)),
         )
         .child(
             card(theme)
@@ -706,71 +932,7 @@ fn appearance_page(config: &crate::config::Config, theme: Theme, cx: &mut Contex
         .into_any_element()
 }
 
-fn screenshot_page(config: &crate::config::Config, theme: Theme, cx: &mut Context<Settings>) -> AnyElement {
-    let action = config.finish_action;
-    let dim = config.dim_strength;
-
-    let actions: Vec<AnyElement> = FinishAction::ALL
-        .into_iter()
-        .map(|option| {
-            let active = option == action;
-            div()
-                .id(option.label())
-                .flex()
-                .items_center()
-                .justify_center()
-                .h(px(CONTROL_HEIGHT))
-                .px(px(14.0))
-                .rounded(px(RADIUS_CONTROL))
-                .cursor_pointer()
-                .bg(if active { theme.accent } else { theme.subtle_pressed })
-                .text_color(if active { theme.on_accent } else { theme.text })
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |_this, _event, _window, cx| {
-                        app::update_config(cx, |config| config.finish_action = option);
-                        cx.notify();
-                    }),
-                )
-                .child(option.label())
-                .into_any_element()
-        })
-        .collect();
-
-    let dims: Vec<AnyElement> = [0.2f32, 0.42, 0.62]
-        .into_iter()
-        .map(|value| {
-            let active = (value - dim).abs() < 0.01;
-            let label = if value < 0.3 {
-                "浅"
-            } else if value < 0.5 {
-                "中"
-            } else {
-                "深"
-            };
-            div()
-                .id(("dim", (value * 100.0) as u32))
-                .flex()
-                .items_center()
-                .justify_center()
-                .h(px(CONTROL_HEIGHT))
-                .px(px(16.0))
-                .rounded(px(RADIUS_CONTROL))
-                .cursor_pointer()
-                .bg(if active { theme.accent } else { theme.subtle_pressed })
-                .text_color(if active { theme.on_accent } else { theme.text })
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |_event_this, _event, _window, cx| {
-                        app::update_config(cx, |config| config.dim_strength = value);
-                        cx.notify();
-                    }),
-                )
-                .child(label)
-                .into_any_element()
-        })
-        .collect();
-
+fn screenshot_page(state: &Settings, _config: &crate::config::Config, theme: Theme, cx: &mut Context<Settings>) -> AnyElement {
     div()
         .flex()
         .flex_col()
@@ -778,13 +940,14 @@ fn screenshot_page(config: &crate::config::Config, theme: Theme, cx: &mut Contex
         .child(
             card(theme)
                 .child(div().child("Enter / 双击选区 的动作"))
-                .child(div().flex().flex_row().gap(px(8.0)).children(actions)),
+                .child(caption("框选完成后按 Enter 或双击选区，直接执行这一步".into(), theme))
+                .child(setting_row_dropdown(state, Select::FinishAction, "执行", theme, cx)),
         )
         .child(
             card(theme)
                 .child(div().child("选区外的遮罩浓度"))
                 .child(caption("截图窗口一打开就整屏变暗，方便看清将要框选的区域".into(), theme))
-                .child(div().flex().flex_row().gap(px(8.0)).children(dims)),
+                .child(setting_row_dropdown(state, Select::Dim, "浓度", theme, cx)),
         )
         .into_any_element()
 }
@@ -977,8 +1140,7 @@ fn toggle(
     theme: Theme,
     cx: &mut Context<Settings>,
     mutate: fn(&mut crate::config::Config),
-) -> AnyElement {
-    let mut knob = div()
+) -> AnyElement {    let mut knob = div()
         .w(px(12.0))
         .h(px(12.0))
         .rounded(px(6.0))
@@ -1008,5 +1170,118 @@ fn toggle(
             }),
         )
         .child(knob)
+        .into_any_element()
+}
+
+/// The logo, as a GPUI image.
+///
+/// It comes from `assets/logo.png`, the same one file the tray icon, the
+/// executable's icon resource and the installer are all built from, so the mark
+/// on this page cannot drift away from the icon in the notification area.
+fn logo_image(size: i32) -> std::sync::Arc<gpui_kit::RenderImage> {
+    use std::sync::Arc;
+
+    let rgba = crate::win::icon::rasterize(size);
+    let size = size.clamp(1, 1024) as u32;
+    // `RenderImage` wants BGRA, and premultiplied: the renderer blends with
+    // straight multiplication, so a transparent pixel that still carries colour
+    // would fringe.
+    let mut bgra = rgba;
+    for pixel in bgra.chunks_exact_mut(4) {
+        let alpha = pixel[3] as u32;
+        let scale = |channel: u8| ((channel as u32 * alpha) / 255) as u8;
+        let (r, g, b) = (scale(pixel[0]), scale(pixel[1]), scale(pixel[2]));
+        pixel[0] = b;
+        pixel[1] = g;
+        pixel[2] = r;
+    }
+    let buffer = image::RgbaImage::from_raw(size, size, bgra).expect("logo dimensions match");
+    Arc::new(gpui_kit::RenderImage::new(vec![image::Frame::new(buffer)]))
+}
+
+/// The about page: what this is, and which build it is.
+///
+/// The version comes from `CARGO_PKG_VERSION`, so it is the version in
+/// `Cargo.toml` at build time — which is exactly what `package.ps1` rewrites, and
+/// what the executable's own version resource and the installer are stamped with.
+fn about_page(theme: Theme, _cx: &mut Context<Settings>) -> AnyElement {
+    let version = env!("CARGO_PKG_VERSION");
+    let name = env!("CARGO_PKG_DESCRIPTION");
+
+    let row = |label: &'static str, value: String, theme: Theme| -> AnyElement {
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .gap(px(12.0))
+            .child(
+                div()
+                    .text_size(px(TEXT_BODY))
+                    .text_color(theme.text_secondary)
+                    .child(label),
+            )
+            .child(
+                div()
+                    .text_size(px(TEXT_BODY))
+                    .text_color(theme.text)
+                    .child(value),
+            )
+            .into_any_element()
+    };
+
+    // The image itself, not an entity: `img` takes the render image directly.
+    let logo = logo_image(96);
+
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(12.0))
+        .child(
+            card(theme)
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(16.0))
+                        .child(img(logo).w(px(96.0)).h(px(96.0)))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(6.0))
+                                .child(
+                                    div()
+                                        .text_size(px(TEXT_TITLE))
+                                        .text_color(theme.text)
+                                        .child("xshot"),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(TEXT_BODY))
+                                        .text_color(theme.text_secondary)
+                                        .child(format!("版本 {version}")),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(TEXT_CAPTION))
+                                        .text_color(theme.text_secondary)
+                                        .child(name),
+                                ),
+                        ),
+                ),
+        )
+        .child(
+            card(theme)
+                .child(row("程序名", "xshot".into(), theme))
+                .child(row("版本", version.into(), theme))
+                .child(row("目标平台", format!("Windows {}", std::env::consts::ARCH), theme))
+                .child(caption(
+                    "版本号来自 Cargo.toml，打包时由 package.ps1 改写；exe 的属性页显示的也是它。"
+                        .into(),
+                    theme,
+                )),
+        )
         .into_any_element()
 }

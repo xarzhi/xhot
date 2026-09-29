@@ -11,6 +11,7 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
 
+use gpui_kit::base::{Toolbar, ToolbarGroup};
 use gpui_kit::*;
 
 use crate::annot::{BRUSHES, ERASERS, MosaicPreview, PALETTE, Pt, Rect, Shape, Tool, WIDTHS};
@@ -836,12 +837,13 @@ impl Overlay {
                         cx.stop_propagation();
                     }),
                 )
-                .child(art.element(16.0, rgb(0xD8D8D8)))
+                .child(art.element(18.0, rgb(0xD8D8D8)))
                 .into_any_element()
         };
         Some(
-            div()
-                .id("xshot-session-toolbar")
+            // Same container as the framing toolbar: the session's two buttons
+            // are a toolbar too, and this one sits inside the window region.
+            Toolbar::new("xshot-session-toolbar")
                 .absolute()
                 .left(px(rect.x))
                 .top(px(rect.y))
@@ -857,8 +859,16 @@ impl Overlay {
                 .border_1()
                 .border_color(rgba(0xFFFF_FF26))
                 .shadow_lg()
-                .child(button(Art::SessionKeep, Action::SessionKeep, cx))
-                .child(button(Art::Cancel, Action::SessionDiscard, cx))
+                .child(
+                    ToolbarGroup::new("xshot-session-actions")
+                        .label("长截图")
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(4.0))
+                        .child(button(Art::SessionKeep, Action::SessionKeep, cx))
+                        .child(button(Art::Cancel, Action::SessionDiscard, cx)),
+                )
                 .into_any_element(),
         )
     }
@@ -1646,6 +1656,18 @@ impl Overlay {
             || (self.tool.is_none() && self.shape_box_at(position).is_some())
         {
             return None;
+        }
+        // Inside a selection that is already made there is nothing to start —
+        // dragging moves it — so the pointer is the four-way move arrow, which is
+        // what `None` means here (the caller asks Windows for it).
+        if self.tool.is_none() && self.selection.is_some_and(|selection| selection.contains(position))
+        {
+            return None;
+        }
+        // The window lit up under the pointer, on the other hand, is one click
+        // away from being selected, so that one points.
+        if self.selection.is_none() && self.hover_rect.is_some_and(|hover| hover.contains(position)) {
+            return Some(CursorStyle::PointingHand);
         }
         Some(CursorStyle::Crosshair)
     }
@@ -2956,7 +2978,7 @@ impl Overlay {
                         cx.stop_propagation();
                     }),
                 )
-                .child(art.element(16.0, if active { rgb(0xFFFFFF) } else { rgb(0xD8D8D8) }))
+                .child(art.element(18.0, if active { rgb(0xFFFFFF) } else { rgb(0xD8D8D8) }))
                 .into_any_element()
         };
 
@@ -3139,8 +3161,11 @@ impl Overlay {
         };
 
         Some(
-            div()
-                .id("xshot-toolbar")
+            // `gpui_base::Toolbar` is the behaviour primitive, not a skin: it
+            // contributes the container, the `toolbar` role for assistive
+            // technology and roving arrow-key focus between its items, and no
+            // styling at all. The look below is still ours, and it is unchanged.
+            Toolbar::new("xshot-toolbar")
                 .absolute()
                 .right(px(right))
                 .top(px(top))
@@ -3155,19 +3180,52 @@ impl Overlay {
                 .border_1()
                 .border_color(rgba(0xFFFF_FF26))
                 .shadow_lg()
-                .children(tools)
-                .child(divider())
-                .children(swatches)
+                .child(
+                    ToolbarGroup::new("xshot-toolbar-tools")
+                        .label("标注工具")
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(4.0))
+                        .children(tools),
+                )
                 .child(divider())
                 .child(
-                    div()
-                        .text_size(px(11.0))
-                        .text_color(rgba(0xFFFF_FFB3))
-                        .child(sizes_label),
+                    ToolbarGroup::new("xshot-toolbar-colours")
+                        .label("颜色")
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(4.0))
+                        .children(swatches),
                 )
-                .children(sizes)
-                .children(block_row)                .child(divider())
-                .children(actions)
+                .child(divider())
+                .child(
+                    ToolbarGroup::new("xshot-toolbar-widths")
+                        .label("线宽")
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(4.0))
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(rgba(0xFFFF_FFB3))
+                                .child(sizes_label),
+                        )
+                        .children(sizes)
+                        .children(block_row),
+                )
+                .child(divider())
+                .child(
+                    ToolbarGroup::new("xshot-toolbar-actions")
+                        .label("完成")
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(4.0))
+                        .children(actions),
+                )
                 .children(hint)
                 .into_any_element(),
         )

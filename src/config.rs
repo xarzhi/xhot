@@ -95,6 +95,51 @@ impl FinishAction {
     }
 }
 
+/// What a single left click on the tray icon does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrayClick {
+    /// Start a capture, exactly like the hotkey.
+    Capture,
+    /// Bring the settings window up (or back, if it is behind something).
+    Settings,
+}
+
+impl Default for TrayClick {
+    fn default() -> Self {
+        // The old behaviour was a double click that started a capture, and a
+        // single click that did nothing; keeping the capture as the single click
+        // is what that muscle memory expects.
+        Self::Capture
+    }
+}
+
+impl TrayClick {
+    pub const ALL: [TrayClick; 2] = [TrayClick::Capture, TrayClick::Settings];
+
+    /// The value the tray thread reads back out of its atomic.
+    pub fn from_u32(raw: u32) -> Self {
+        match raw {
+            1 => Self::Settings,
+            _ => Self::Capture,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Capture => "截图",
+            Self::Settings => "打开设置面板",
+        }
+    }
+
+    pub fn hint(self) -> &'static str {
+        match self {
+            Self::Capture => "和快捷键一样，直接开始框选",
+            Self::Settings => "窗口已经开着就会把它提到前面",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -110,6 +155,14 @@ pub struct Config {
     pub autostart: bool,
     /// Start without opening the settings window — just the tray icon.
     pub silent_start: bool,
+    /// What a single left click on the tray icon does.
+    pub tray_left_click: TrayClick,
+    /// Skip the capture entirely while a fullscreen window is in the foreground.
+    ///
+    /// A fullscreen game or video is rarely what a screenshot is wanted from, and
+    /// an overlay dropped on it is more likely to be a mis-typed hotkey than an
+    /// intent.
+    pub skip_when_fullscreen: bool,
     /// Corner radius of the finished shot, in logical pixels.
     pub corner_radius: f32,
 
@@ -152,6 +205,8 @@ impl Default for Config {
             // A screenshot tool lives in the tray; showing the settings window
             // on every login would be noise.
             silent_start: true,
+            tray_left_click: TrayClick::default(),
+            skip_when_fullscreen: true,
             corner_radius: 0.0,
             theme: ThemeChoice::default(),
             pin_shadow: true,
@@ -249,5 +304,35 @@ impl Config {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The tray click travels to the tray thread as a `u32`, so both directions
+    /// of that conversion have to agree with the JSON spelling.
+    #[test]
+    fn tray_click_survives_the_json_and_the_atomic() {
+        for option in TrayClick::ALL {
+            let json = serde_json::to_string(&option).unwrap();
+            let back: TrayClick = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, option, "{json} did not come back");
+            assert_eq!(TrayClick::from_u32(option as u32), option);
+        }
+        assert_eq!(serde_json::to_string(&TrayClick::Capture).unwrap(), "\"capture\"");
+        assert_eq!(
+            serde_json::to_string(&TrayClick::Settings).unwrap(),
+            "\"settings\""
+        );
+    }
+
+    /// A config written before this setting existed still loads, with the old
+    /// double-click behaviour as the single click.
+    #[test]
+    fn a_config_without_the_tray_click_defaults_to_capturing() {
+        let config: Config = serde_json::from_str("{\"hotkey_capture\":\"F1\"}").unwrap();
+        assert_eq!(config.tray_left_click, TrayClick::Capture);
     }
 }

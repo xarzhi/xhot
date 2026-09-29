@@ -1,17 +1,19 @@
 [package]
 name = "xshot"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "A lean Windows screenshot tool built with GPUI"
 
 [dependencies]
-# UI layer. `component` (gpui-component) is intentionally disabled: gpui-base
-# already provides theming and controls, and dropping the heavier layer keeps
-# the binary small and startup fast.
-gpui-kit = { version = "0.6.6", default-features = false }
+# UI layer. `component` is gpui-component, the styled widget library of the kit
+# (`gpui_kit::component`): the settings window's dropdowns are its `Select`
+# rather than a hand-rolled list. `assets` brings the kit's default icons and
+# fonts, which those widgets expect to find.
+gpui-kit = { version = "0.7.0", default-features = false, features = ["component", "assets"] }
 
-# Image encoding (PNG) for saving shots.
-image = "0.25"
+# Image encoding (PNG) for saving shots. Only PNG is written or read here, so the
+# other codecs (jpeg, gif, webp, tiff, ...) are switched off.
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 # Configuration persistence.
 serde = { version = "1", features = ["derive"] }
@@ -64,9 +66,13 @@ features = [
 
 [profile.release]
 opt-level = 3
-lto = "thin"
+# Across every crate, not just within one: this is the difference between a 23 MB
+# executable and a noticeably smaller one once a component library is linked in.
+lto = "fat"
 codegen-units = 1
 strip = true
+# Nothing here catches a panic, and the unwind tables are pure weight.
+panic = "abort"
 
 # Installer packaging. `cargo packager --release` produces a per-user NSIS
 # installer in `dist/`; the icon is not a checked-in drawing but the output of
